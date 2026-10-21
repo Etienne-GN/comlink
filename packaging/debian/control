@@ -1,0 +1,69 @@
+Source: comlink
+Section: comm
+Priority: optional
+Maintainer: Étienne Gagné <etienne.gagnenadeau@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               cmake,
+               pkgconf,
+               libyaml-dev,
+               libsqlite3-dev,
+               libssl-dev,
+               libasound2-dev,
+               uuid-dev,
+               libopus-dev,
+# Opus recordings are OggOpus; libogg does the page framing rather
+# than us.
+               libogg-dev,
+               qt6-base-dev,
+# The frontend is QML now. qt6-declarative-dev brings Qt Quick and
+# qmlimportscanner; qt6-shadertools-dev is what compiles the shaders
+# Qt Quick's scene graph needs at build time.
+               qt6-declarative-dev,
+               qt6-shadertools-dev,
+# The command-line sqlite3, for a test that seeds a call with a
+# recording into the store: a recording needs a live call to exist,
+# and what is under test is what the history list does with the row.
+               sqlite3,
+# whisper.cpp for call transcripts. Not in Debian 13, so the trixie
+# build sets the pkg.comlink.nowhisper profile and ships a phone whose
+# transcript module says it has no speech engine.
+               libwhisper-dev <!pkg.comlink.nowhisper>
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: comlink
+Architecture: any
+# The QML modules the window imports are loaded at run time, so
+# dpkg-shlibdeps cannot see them: without these a machine that has no
+# Qt development packages installs comlink and cannot open it
+# ("module QtQuick.Window is not installed").
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         qml6-module-qtquick,
+         qml6-module-qtquick-window,
+         qml6-module-qtquick-dialogs
+Recommends: ffmpeg
+Replaces: comlink-core, comlink-cli, comlink-dev
+Breaks: comlink-core, comlink-cli, comlink-dev
+Description: SIP endpoint and diagnostic instrument for telephony technicians
+ Qt Quick desktop endpoint and command-line instrument over a shared
+ pure C core: dialer with keypad, per-account registration control,
+ call list with hold, transfer, DTMF and recording, and a field for
+ attaching ad-hoc SIP headers to an individual call.
+ .
+ The window is one QML tree rendered by Qt on Debian and on Android,
+ so the two platforms are the same application rather than two that
+ agree.
+ .
+ Declarative SIP header rewriting, SIP message capture, call history
+ and per-call audio quality metrics taken from RTCP. The rule set and
+ every setting live in one YAML file shared with the Android build, so
+ both platforms behave identically.
+ .
+ Handles are never reused, so a stale handle cannot act on an unrelated
+ call, and events are delivered from a single dispatch thread so a slow
+ frontend cannot stall signalling.
+ .
+ One package rather than the usual library split: the shared library
+ has exactly two consumers, both shipped here, so splitting it would
+ have made three packages to install and nothing to gain. The C ABI
+ header is included for building against the core.

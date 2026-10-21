@@ -1,0 +1,13 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@ --buildsystem=cmake
+
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release
+
+# The integration label needs raw-socket privileges for tcpdump, which
+# a package build does not have. It runs from ctest in development.
+override_dh_auto_test:
+	dh_auto_test -- ARGS="--output-on-failure -LE integration"

@@ -1,0 +1,30 @@
+build/
+third_party/prefix-*/
+/debian/
+obj-*/
+*.o
+*.a
+*.so
+*.so.*
+compile_commands.json
+*.pcap
+
+# Scratch output from stress runs and packet captures.
+/run/
+
+# Never a call database, a SIP trace or a capture: these hold dialled
+# numbers, caller identities and PBX hostnames.
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# The Android cross-build prefixes and build trees, one per ABI.
+third_party/prefix-android-*/
+build-android-*/
+
+# Qt cross-built for Android: sources and prefix.
+third_party/qt-android-src/
+third_party/prefix-qt-android-*/
+build-quick-*/
+.superpowers/

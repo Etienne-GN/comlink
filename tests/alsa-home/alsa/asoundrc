@@ -1,0 +1,45 @@
+# ALSA overrides for headless runs.
+#
+# Loaded via XDG_CONFIG_HOME: the hook at the top of
+# /usr/share/alsa/alsa.conf loads, in order, /etc/alsa/conf.d,
+# /etc/asound.conf, ~/.asoundrc and finally
+# $XDG_CONFIG_HOME/alsa/asoundrc. Last one wins, which is why the
+# overrides live here and not in a file named by ALSA_CONFIG_PATH:
+# definitions in that file are loaded *before* the hook runs, so
+# /etc/alsa/conf.d/99-pipewire-default.conf overrides them and the
+# whole exercise does nothing. Measured with amixer, not assumed.
+#
+# Why any of this is needed: with the pipewire socket unreachable, the
+# ALSA pipewire plugin's failure path calls pw_thread_loop_stop(),
+# which joins a loop thread nothing wakes, and the process hangs inside
+# pjsua_init before any Comlink code runs. dpkg-buildpackage runs the
+# suite without the operator's session, so it hits exactly that
+# condition. See docs/known-issues.md.
+#
+# There are TWO paths into that plugin, and overriding only the first
+# left the suite hanging again a few hours later:
+#
+#   1. pjmedia's get_mixer_name() calls
+#      snd_mixer_attach(handle, "default"), and ctl.default is the
+#      pipewire plugin on a desktop Debian box.
+#   2. device enumeration probes named PCMs, so it opens pcm.pipewire,
+#      pcm.pulse and pcm.jack directly, whatever "default" points at.
+#
+# So every sound-server namespace is redirected, not just default.
+# Hardware devices still enumerate normally, which is what keeps
+# pjmedia's audio subsystem valid: with no devices at all it fails with
+# PJMEDIA_EAUD_SYSERR and pjsua_init fails outright.
+#
+# A card that may not exist is fine: pjmedia gives up on the mixer
+# label and carries on. A plugin that hangs is not.
+
+ctl.!default   { type hw card 0 }
+pcm.!default   { type null }
+
+ctl.!pipewire  { type hw card 0 }
+pcm.!pipewire  { type null }
+
+ctl.!pulse     { type hw card 0 }
+pcm.!pulse     { type null }
+
+pcm.!jack      { type null }

@@ -1,0 +1,12 @@
+log_level: 0
+sip_port: @PORT@
+audio_device: none
+codec_priority: [PCMU]
+tls_cert_file: @CERTDIR@/cert.pem
+tls_key_file: @CERTDIR@/key.pem
+accounts:
+  - id: b
+    user: bob
+    domain: 127.0.0.1
+    transport: tls
+    register: false

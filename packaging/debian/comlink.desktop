@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Comlink
+GenericName=SIP Softphone
+Comment=SIP endpoint and diagnostic instrument for telephony technicians
+Exec=comlink
+Icon=comlink
+Terminal=false
+Categories=Network;Telephony;
+Keywords=SIP;VoIP;phone;telephony;diagnostics;

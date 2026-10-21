@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The dark preset's background, so the launcher icon sits on the
+     colour the window opens with by default. -->
+<resources>
+    <color name="ic_launcher_background">#12151A</color>
+</resources>

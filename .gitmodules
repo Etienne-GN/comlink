@@ -1,0 +1,36 @@
+[submodule "third_party/pjproject"]
+	path = third_party/pjproject
+	url = https://github.com/pjsip/pjproject.git
+	branch = master
+[submodule "third_party/libyaml"]
+	path = third_party/libyaml
+	url = https://github.com/yaml/libyaml
+	# Pinned to the tag matching the system libyaml, so Android and
+	# Debian parse the same YAML.
+	branch = 0.2.5
+[submodule "third_party/libogg"]
+	path = third_party/libogg
+	url = https://github.com/xiph/ogg
+	# Pinned to the tag matching the system libogg.
+	branch = v1.3.6
+[submodule "third_party/libopus"]
+	path = third_party/libopus
+	url = https://github.com/xiph/opus
+	# Pinned to the tag matching the system libopus. pjproject refuses
+	# to autodetect Opus when cross-compiling, so this is also what
+	# --with-opus points at.
+	branch = v1.6.1
+[submodule "third_party/openssl"]
+	path = third_party/openssl
+	url = https://github.com/openssl/openssl
+	# Pinned to the tag matching the system OpenSSL. pjproject will not
+	# autodetect SSL when cross-compiling, so this is what --with-ssl
+	# points at and the only source of TLS on Android.
+	branch = openssl-3.6.4
+[submodule "third_party/whisper.cpp"]
+	path = third_party/whisper.cpp
+	url = https://github.com/ggml-org/whisper.cpp
+	# Pinned to the tag matching the system whisper.cpp, so a model the
+	# Debian build loads is one the handset loads. Android only: Debian
+	# links libwhisper-dev.
+	branch = v1.9.5

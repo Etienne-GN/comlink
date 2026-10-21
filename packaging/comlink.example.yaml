@@ -1,0 +1,244 @@
+# comlink configuration. Every key is listed; unknown keys are a hard
+# error rather than a warning, so a typo fails loudly at startup.
+
+log_level: 3            # 0..5
+sip_port: 0             # 0 = ephemeral
+# Audio devices. Names come from the "audio" command in comlink-cli or
+# from the Audio window in the GUI; they are ALSA device names on
+# Debian. Unset means the system default.
+#
+# "none" disables audio entirely: calls still connect, SIP is still
+# traced and quality is still measured from RTCP, but nothing is played
+# or captured. That is the right setting for a headless box, and it
+# also makes startup skip ALSA device enumeration altogether, which is
+# what stops a broken pipewire from hanging the phone. See
+# docs/known-issues.md.
+# audio_device: none
+
+# Separate microphone and speaker, for the common case of a headset mic
+# with the speakers on the desk. Either may be left unset.
+# audio_capture_device: "hw:CARD=PCH,DEV=0"
+# audio_playback_device: "plughw:CARD=PCH,DEV=0"
+
+# Whether the GUI shows its activity pane along the bottom. Turning it
+# off gives the whole window to the phone; the same lines are still
+# recorded and are in the log window. Settings > Window in the GUI.
+show_activity_log: true
+
+# Window size, remembered when the GUI is closed so it comes back the
+# size you left it. Absent means "use the built-in default". Only the
+# size is kept, not the position: on Wayland the compositor places
+# windows and a remembered position is ignored or wrong.
+# window_width: 380
+# window_height: 660
+
+# How often to sample audio quality from the media stack, in
+# milliseconds. 0 turns sampling off entirely. Otherwise 100..60000.
+metrics_interval_ms: 2000
+
+# Volume, as a percentage. 100 is unity, 0 is silence, 200 is twice as
+# loud. Two independent directions: tx is the microphone, which is what
+# the far end hears, and rx is the speaker, which is what you hear.
+#
+# Both are on the main window with a mute button each, because a mute
+# you have to navigate to is not a mute. Mute itself is deliberately
+# not persisted: a phone that starts muted because it was left muted is
+# a support call.
+tx_volume: 100
+rx_volume: 100
+
+# Sounds. A name from the sound library, an absolute path to a WAV, or
+# "none" for silence. Absent means the built-in default, which is the
+# first bundled sound for the slot -- except the notification, where a
+# busy tone is preferred over a dial tone, because that is what a call
+# ending unanswered sounds like on a real phone.
+#
+# Names come from the "sounds" command in comlink-cli, or the Sounds
+# window in the GUI. The library is /usr/share/comlink/sounds for the
+# bundled files and <this directory>/sounds for anything imported; a
+# name in both resolves to the imported copy.
+#
+# WAV only. pjmedia's file player has no other decoder, and the GUI
+# converts on import with ffmpeg when one is available.
+#
+# These play to the speaker only. The far end never hears them.
+# ringtone: universfield-ringtone-049-494667
+# ringback: none
+# notification_sound: izafi-analog_busy_tone-431285
+
+# Signal processing. Defaults suit a measuring instrument rather than a
+# consumer phone: anything that alters what you hear is off unless you
+# ask for it. Echo cancellation is the exception, because a speakerphone
+# without it howls, and that is not a diagnosis.
+#
+# The echo settings take effect at once, including on a call already up.
+# The codec settings below them apply to the next call, because a
+# codec's parameters are fixed once its stream exists.
+echo_cancel: true
+echo_tail_ms: 200          # 0..500
+noise_suppression: false   # changes what you hear; opt in
+auto_gain: false           # likewise
+
+comfort_noise: true        # only audible with silence suppression on
+# Packet loss concealment. Turning it off is a diagnostic technique:
+# you hear each lost packet instead of the stack hiding it.
+packet_loss_concealment: true
+
+# Silence suppression. Off by default: a phone that stops sending RTP
+# during silence reports jitter and loss measured over a handful of
+# packets, which is the opposite of useful when you are diagnosing a
+# trunk. Set true to behave like an ordinary softphone.
+silence_suppression: false
+
+# Parts of the phone that can be switched off. Absent means on, so a
+# configuration without this section is a phone with everything.
+#
+# Off means inert, not hidden: the work stops, the controls go away,
+# and asking the core to do it anyway is an error rather than a quiet
+# no-op. Nothing already recorded or logged is removed by switching a
+# module off.
+#
+#   recording       call recording and its button
+#   audio_quality   RTCP sampling, MOS, the quality window
+#   sip_trace       SIP message capture and the trace view
+#
+# sip_core is the phone itself and is not listed: it cannot be
+# switched off. Theming, the activity log and the call history are
+# not modules either -- they are what the phone is, rather than
+# things it can do without.
+#
+# sip_log is the old spelling of modules.sip_trace, and
+# metrics_interval_ms: 0 the old spelling of audio_quality off. Both
+# still load and convert on the next save; having both spellings at
+# once is an error.
+# modules:
+#   recording: true
+#   audio_quality: true
+#   sip_trace: true
+
+# Recordings: where they land and in what form.
+#
+#   dir     an absolute path. Absent means a "recordings" directory
+#           beside this file. A relative path is refused: relative to
+#           what has no good answer once the phone has a working
+#           directory nobody chose.
+#   format  wav       16-bit PCM, about 1920 KB a minute, plays anywhere
+#           wav_ulaw  G.711 in a WAV container, about 960 KB a minute.
+#           opus      Ogg/Opus, 24 kbps mono, about 180 KB a minute.
+#
+#           All three record the mixed conversation at the conference
+#           bridge's rate (16 kHz), not the call's own codec rate --
+#           none is a bit-exact copy of what crossed the wire.
+#           wav_ulaw simply halves the WAV file size for a modest loss
+#           of quality. opus is roughly a fifth the size of wav and
+#           plays in current browsers and in VLC, but Windows support
+#           depends on the version installed -- for a recording that
+#           may one day leave this building, wav is the format nobody
+#           has to argue with.
+#
+# A recording of a real call is a recording of somebody's voice. Where
+# you point this is a decision with more weight than a directory
+# chooser can show.
+#
+# recording:
+#   dir: /home/you/.config/comlink/recordings
+#   format: wav
+
+# Where the Export button in the log window's SIP tab writes a call's
+# SIP messages. Absent means a "traces" directory beside this file.
+# It honours sip_log_redact, because a file on disk is easier to
+# forward than a database is.
+#
+# sip_trace:
+#   export_dir: /home/you/.config/comlink/traces
+
+# Codecs, highest priority first. Global rather than per-account:
+# pjsua_codec_set_priority has no per-account form.
+#
+# An absent setting means the codec's own default, so a bare
+# "- id: G722" is the whole entry for a codec you only want ordered.
+# Both "opus" and the stack's full "opus/48000/2" are accepted; the
+# GUI writes the long form back.
+#
+#   enabled            false stops it being offered at all
+#   bitrate            bps, opus only -- no other codec here has one
+#   complexity         0..10, encoder effort
+#   expected_loss_pct  0..100; above zero is what makes opus send FEC
+#   ptime_ms           audio per packet; a multiple of the codec frame
+#   cbr                constant bit rate
+#
+# codec_priority is the old spelling of this. It still loads and is
+# converted on the next save; having both at once is an error.
+codecs:
+  - id: opus
+  - id: G722
+  - id: PCMU
+  - id: PCMA
+
+accounts:
+  - id: work                     # stable name, referenced by header rules
+    user: 1001
+    domain: pbx.example.lan
+    auth_user: 1001              # optional, defaults to user
+    password: CHANGEME
+    registrar: sip:pbx.example.lan
+    transport: udp               # udp | tcp | tls
+    reg_expires_s: 300
+    register: true
+    # stun_server: stun.example.lan
+    # outbound_proxy: sip:proxy.example.lan
+    srtp: disabled               # disabled | optional | mandatory
+                                 # mandatory without transport: tls means
+                                 # the SDES keys travel in cleartext SDP
+
+# Named sets of ad-hoc headers, offered by both frontends. Applying one
+# stages its headers for the next call; they are applied after the rules
+# below, so they always win.
+header_presets:
+  - name: incident
+    headers:
+      - {name: X-Ticket, value: "INC-0000"}
+      - {name: X-Priority, value: high}
+
+# Header names seen before, offered as completion in the editor. The
+# app appends to this itself as you save presets.
+header_names: ["X-Ticket", "X-Priority"]
+
+# Theme. Resolved in the core and applied by each frontend, so the
+# Debian and Android builds cannot drift apart.
+#
+# Dark presets:  dark, gold, high_contrast, amber_crt, green_phosphor,
+#                oscilloscope, copper_pair, punchdown, nebula,
+#                event_horizon, aurora, redshift, kyber
+# Light presets: light, paper_tape, white_dwarf
+theme:
+  preset: dark
+  text_scale: medium           # small | medium | large | extra_large
+  # accent: "#378ADD"          # optional, overrides the preset
+  # font: Cinzel               # optional, overrides the preset
+
+header_rules:
+  # Rules apply in file order; all matching rules apply. Per-call ad-hoc
+  # headers are applied afterwards, so they always win.
+  #
+  # WARNING on direction: rx. Verified behaviour (see
+  # docs/verification-13-3-rx-ordering.md): rx rules take effect BEFORE
+  # pjsip parses the message, so removing a header the stack needs will
+  # silently destroy calls. Stripping Contact from an inbound INVITE
+  # makes the call never arrive at all: no error, no event, and nothing
+  # in an outbound capture to explain it. Rewrite inbound headers only
+  # when you know what the stack does with them.
+  - name: strip-user-agent
+    direction: tx                # tx | rx
+    message: request             # request | response | any
+    method: [INVITE, REGISTER]
+    actions:
+      - remove: User-Agent
+
+  - name: tag-location
+    direction: tx
+    message: request
+    method: [INVITE]
+    account: work                # omit for all accounts
+    actions:
+      - set: {name: X-Geo-Location, value: "45.4,-71.9"}

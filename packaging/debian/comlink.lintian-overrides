@@ -1,0 +1,26 @@
+# pjproject's bundled libsrtp is statically linked into
+# libcomlink_core, so lintian correctly sees an embedded copy.
+#
+# This is deliberate, not an oversight. Both supported platforms must
+# build from one pinned pjproject revision: Android has no system
+# libsrtp, so linking Debian's libsrtp2 here would leave the two
+# frontends running different SRTP implementations. For a phone whose
+# whole premise is identical behaviour on both platforms, divergence in
+# the media security path is the worst place to accept it.
+#
+# The cost is accepted knowingly: a libsrtp security advisory requires
+# this package to be rebuilt rather than picking up a system update.
+# Whoever maintains this must watch libsrtp advisories directly.
+comlink: embedded-library srtp [usr/lib/*/libcomlink_core.so.*]
+
+# One package holds the application, the shared library and the C ABI
+# header. That is not the usual Debian library split, and lintian is
+# right to notice.
+#
+# Deliberate: the library has exactly two consumers and both ship in
+# this package, so splitting it produced three packages to install and
+# bought nothing. The header comes along because the Android port
+# builds against the same ABI and having it is free.
+comlink: package-name-doesnt-match-sonames
+comlink: shared-library-lacks-prerequisites
+comlink: sharedobject-in-library-directory-missing-soname

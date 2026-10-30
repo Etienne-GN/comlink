@@ -1,0 +1,138 @@
+# Builds the arm64 APK and, for a v* tag, attaches it to a GitHub
+# Release so it can be downloaded without a build machine.
+#
+# Same scripts as a local build, in the same order:
+#   build-deps-android.sh -> build-qt-android.sh -> build-quick-android.sh
+#
+# The host must be Debian with Qt 6.11.2, because the host Qt supplies
+# moc, rcc, qmlcachegen and androiddeployqt and build-qt-android.sh
+# refuses a mismatch. Debian 13 ships 6.8, so this runs in testing.
+# If testing moves past 6.11.2, the Qt step fails with a clear message
+# rather than producing an APK that will not start.
+#
+# Signing: an update installs only over an APK signed with the same
+# key. Put the laptop's ~/.android/debug.keystore in the repository
+# secret DEBUG_KEYSTORE_B64 (base64 -w0 ~/.android/debug.keystore) so
+# CI builds install over local ones. Without it, a throwaway debug key
+# is generated and the job warns.
+
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  ABI: arm64-v8a
+  NDK_VERSION: 27.3.13750724
+  QT_VERSION: 6.11.2
+  ANDROID_SDK_ROOT: /opt/android-sdk
+  ANDROID_NDK_ROOT: /opt/android-sdk/ndk/27.3.13750724
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    container:
+      image: debian:testing
+
+    steps:
+      - name: Host packages
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates curl wget unzip xz-utils file \
+            build-essential autoconf automake libtool pkgconf \
+            cmake ninja-build perl python3 \
+            qt6-base-dev qt6-base-dev-tools \
+            qt6-declarative-dev qt6-declarative-dev-tools \
+            qt6-shadertools-dev
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Trust the workspace for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Android SDK and NDK
+        run: |
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL -o /tmp/cmdline-tools.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
+          mv /tmp/cmdline-tools/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+            "ndk;$NDK_VERSION"
+
+      - name: Signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            echo "$DEBUG_KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+          else
+            echo "::warning::No DEBUG_KEYSTORE_B64 secret: signing with a throwaway debug key. This APK will not install over one built on your machine."
+            keytool -genkeypair -v -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      # The core's dependencies: pjproject, opus, OpenSSL, libyaml,
+      # libogg, SQLite, whisper.cpp. Rebuilt every time, as locally.
+      - name: Core dependencies
+        run: COMLINK_JOBS="$(nproc)" ./scripts/build-deps-android.sh "$ABI"
+
+      # Qt for Android is the long part, so its prefix is cached on
+      # everything that decides what it contains.
+      - name: Cache Qt for Android
+        id: qt-cache
+        uses: actions/cache@v4
+        with:
+          path: third_party/prefix-qt-android-${{ env.ABI }}
+          key: qt-android-${{ env.QT_VERSION }}-${{ env.ABI }}-ndk${{ env.NDK_VERSION }}-${{ hashFiles('scripts/build-qt-android.sh') }}
+
+      - name: Qt for Android
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          COMLINK_JOBS="$(nproc)" ./scripts/build-qt-android.sh "$ABI"
+          # Sources and build trees are several GB; only the prefix is kept.
+          rm -rf third_party/qt-android-src
+
+      - name: APK
+        run: COMLINK_JOBS="$(nproc)" ./scripts/build-quick-android.sh "$ABI"
+
+      - name: Name the APK
+        id: name
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          [ "$GITHUB_REF_TYPE" = tag ] || ver="$(git rev-parse --short HEAD)"
+          out="comlink-${ver}-${ABI}.apk"
+          cp "build-quick-$ABI/comlink-$ABI.apk" "$out"
+          echo "file=$out" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.file }}
+          path: ${{ steps.name.outputs.file }}
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.name.outputs.file }}

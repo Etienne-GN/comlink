@@ -33,6 +33,10 @@ env:
   ANDROID_SDK_ROOT: /opt/android-sdk
   ANDROID_NDK_ROOT: /opt/android-sdk/ndk/27.3.13750724
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   apk:
     runs-on: ubuntu-latest
@@ -52,14 +56,14 @@ jobs:
             qt6-declarative-dev qt6-declarative-dev-tools \
             qt6-shadertools-dev
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
       - name: Trust the workspace for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
@@ -74,8 +78,26 @@ jobs:
           SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
           "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" \
-            "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+            "platform-tools" "platforms;android-34" "platforms;android-35" \
+            "platforms;android-36" "build-tools;35.0.0" \
             "ndk;$NDK_VERSION"
+
+      # A failed build posts its last log lines as an annotation, which
+      # is readable from the run page and the API without the full log.
+      - name: Log helper
+        run: |
+          cat > /usr/local/bin/logged <<'SH'
+          #!/usr/bin/env bash
+          # logged <title> <command...>
+          title="$1"; shift
+          log="/tmp/${title// /_}.log"
+          set -o pipefail
+          if "$@" 2>&1 | tee "$log"; then exit 0; fi
+          body="$(tail -n 60 "$log" | sed -e 's/%/%25/g' -e 's/\r//g' | sed ':a;N;$!ba;s/\n/%0A/g')"
+          echo "::error title=${title} failed::${body}"
+          exit 1
+          SH
+          chmod +x /usr/local/bin/logged
 
       - name: Signing key
         env:
@@ -95,7 +117,7 @@ jobs:
       # The core's dependencies: pjproject, opus, OpenSSL, libyaml,
       # libogg, SQLite, whisper.cpp. Rebuilt every time, as locally.
       - name: Core dependencies
-        run: COMLINK_JOBS="$(nproc)" ./scripts/build-deps-android.sh "$ABI"
+        run: COMLINK_JOBS="$(nproc)" logged "Core dependencies" ./scripts/build-deps-android.sh "$ABI"
 
       # Qt for Android is the long part, so its prefix is cached on
       # everything that decides what it contains.
@@ -109,12 +131,12 @@ jobs:
       - name: Qt for Android
         if: steps.qt-cache.outputs.cache-hit != 'true'
         run: |
-          COMLINK_JOBS="$(nproc)" ./scripts/build-qt-android.sh "$ABI"
+          COMLINK_JOBS="$(nproc)" logged "Qt for Android" ./scripts/build-qt-android.sh "$ABI"
           # Sources and build trees are several GB; only the prefix is kept.
           rm -rf third_party/qt-android-src
 
       - name: APK
-        run: COMLINK_JOBS="$(nproc)" ./scripts/build-quick-android.sh "$ABI"
+        run: COMLINK_JOBS="$(nproc)" logged "APK" ./scripts/build-quick-android.sh "$ABI"
 
       - name: Name the APK
         id: name

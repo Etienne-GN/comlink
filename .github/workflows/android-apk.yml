@@ -76,7 +76,7 @@ jobs:
           unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
           mv /tmp/cmdline-tools/cmdline-tools "$ANDROID_SDK_ROOT/cmdline-tools/latest"
           SDKM="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
+          { yes || true; } | "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null
           "$SDKM" --sdk_root="$ANDROID_SDK_ROOT" \
             "platform-tools" "platforms;android-34" "platforms;android-35" \
             "platforms;android-36" "build-tools;35.0.0" \

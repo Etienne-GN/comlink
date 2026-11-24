@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 # The single source of truth for the version. The Debian changelog is
 # checked against it by tests/packaging/test_deb.sh, so the two cannot
 # drift apart unnoticed.
-project(comlink VERSION 1.0.0 LANGUAGES C CXX)
+project(comlink VERSION 1.1.0 LANGUAGES C CXX)
 
 # Which build this is, which matters more than the version on a tool
 # that gets rebuilt twenty times in an afternoon: every package is

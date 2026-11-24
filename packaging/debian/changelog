@@ -1,3 +1,12 @@
+comlink (1.1.0-1) unstable; urgency=medium
+
+  * Recall earlier calls in the dial field with Up and Down.
+  * Fix call-record and playback lifetime faults and a deadlock.
+  * Refuse header and dial input that could inject into a SIP message.
+  * Keep credentials out of the log, and new files private.
+
+ -- Étienne Gagné <etienne.gagnenadeau@gmail.com>  Tue, 24 Nov 2026 13:25:00 -0500
+
 comlink (1.0.0-1) unstable; urgency=medium
 
   * Initial release.

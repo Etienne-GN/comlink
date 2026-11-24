@@ -67,7 +67,14 @@ Item {
     }
     function reloadActivity() { root.actRows = CoreBridge.activity(1000) }
     function reloadHistory() {
-        root.histRows = CoreBridge.history(500);
+        const keep = root.histRow ? root.histRow.id : -1;
+        const rows = CoreBridge.history(500);
+        let restore = -1;
+        if (keep !== -1)
+            for (let i = 0; i < rows.length; i++)
+                if (rows[i].id === keep) { restore = i; break }
+        root.histRows = rows;
+        root.histCurrent = restore;
         root.refreshPlayback();
     }
     function refreshPlayback() { root.pb = CoreBridge.playback() }
@@ -92,7 +99,7 @@ Item {
     readonly property string recPath: root.histRow ? root.histRow.recording : ""
     readonly property bool sameFile: root.recPath !== ""
         && root.pb.path === root.recPath
-    readonly property bool callUp: CoreBridge.calls().length > 0
+    readonly property bool callUp: CoreBridge.inCall
 
     /* The point of the feature: a call and its signalling in one
        place. */

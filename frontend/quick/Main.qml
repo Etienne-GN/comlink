@@ -98,16 +98,28 @@ Window {
             if (CoreBridge.inCall !== root.hadCall) {
                 root.hadCall = CoreBridge.inCall;
                 root.setExpanded(CoreBridge.inCall);
+                /* The log covers the phone, Answer and Decline with
+                   it: a call starting takes it down, and it comes back
+                   afterwards if it was being kept open. What is
+                   remembered does not change either way. */
+                if (CoreBridge.inCall)
+                    callLog.visible = false;
+                else if (CoreBridge.showCallLog())
+                    callLog.open(false);
+                /* Handed back for typing, cleared on the way out of a
+                   call -- and only then: a dial the core refused also
+                   lands here, with a number the operator will want to
+                   correct rather than type again. */
+                if (!CoreBridge.inCall)
+                    root.dialTarget = "";
             }
             if (!CoreBridge.inCall) {
                 meter.clear();
                 root.peakTx = 0;
                 root.peakRx = 0;
-                /* Handed back for typing, cleared on the way out of a
-                   call, and focused so the next number can be typed --
-                   on the desktop. On the handset focus opens the
-                   keyboard, over a keypad that is already there. */
-                root.dialTarget = "";
+                /* Focused so the next number can be typed -- on the
+                   desktop. On the handset focus opens the keyboard,
+                   over a keypad that is already there. */
                 if (root.desktop)
                     prompt.forceActiveFocus();
             }
@@ -286,6 +298,66 @@ Window {
                 return h.name + "|" + h.value }));
     }
 
+    /* Up and Down walk the call history through the number, as a
+       shell does its command line: what was being typed is kept and
+       comes back below the newest entry. Any other edit ends the walk. */
+    property var recallRows: []
+    property int recallAt: -1
+    property string recallDraft: ""
+    property bool recalling: false
+    onDialTargetChanged: if (!recalling) recallAt = -1
+
+    /* The extension alone when the call was on the selected account's
+       own domain, where dialling it reaches the same party; the whole
+       URI otherwise, because an extension would go somewhere else. */
+    function recallTarget(remote) {
+        const m = /sips?:([^@;>]+)@([^;>:]+)/.exec(remote);
+        if (m && root.currentAccount
+            && m[2].toLowerCase() === root.currentAccount.domain.toLowerCase()) {
+            try { return decodeURIComponent(m[1]) } catch (e) { return m[1] }
+        }
+        return remote;
+    }
+    readonly property string recallNote: {
+        if (recallAt < 0 || recallAt >= recallRows.length)
+            return "";
+        const r = recallRows[recallAt];
+        return (r.inbound ? (r.answered ? "↙ incoming call" : "↙ missed call")
+                          : "↗ outgoing call")
+               + "  ·  " + Qt.formatDateTime(new Date(r.startUs / 1000),
+                                             "MM-dd HH:mm");
+    }
+
+    function recall(step) {
+        if (!root.desktop || CoreBridge.inCall)
+            return false;
+        if (recallAt < 0) {
+            if (step < 0)
+                return true;
+            const seen = {};
+            const rows = [];
+            for (const r of CoreBridge.history(200)) {
+                if (r.remote === "" || r.remote === "-")
+                    continue;
+                const target = recallTarget(r.remote);
+                if (seen[target])
+                    continue;
+                seen[target] = true;
+                rows.push({ target: target, inbound: r.inbound,
+                            answered: r.answered, startUs: r.startUs });
+            }
+            recallRows = rows;
+            recallDraft = dialTarget;
+        }
+        const at = Math.min(recallAt + step, recallRows.length - 1);
+        recalling = true;
+        dialTarget = at < 0 ? recallDraft : recallRows[at].target;
+        recalling = false;
+        recallAt = at;
+        prompt.cursorPosition = prompt.length;
+        return true;
+    }
+
     /* The on-screen keypad takes over from the keyboard on the
        handset. A field still focused behind a minimised keyboard keeps
        the keyboard's own idea of its text, and edits made around it --
@@ -306,7 +378,10 @@ Window {
     function enterDigit(d) {
         CoreBridge.silenceFailureTone();
         const left = CoreBridge.enterDigit(d);
-        if (left !== "")
+        /* Not while a call is still setting up: the field shows the
+           far end then, and the digits gathered behind it, unseen,
+           until Call dialled them as a second call. */
+        if (left !== "" && !CoreBridge.inCall)
             root.dialTarget += left;
         else if (CoreBridge.callState === 5)
             CoreBridge.note("sent DTMF " + d);
@@ -392,6 +467,12 @@ Window {
                    call that failed. */
                 CoreBridge.silenceFailureTone();
                 const plain = !(e.modifiers & ~Qt.ShiftModifier);
+                if ((e.key === Qt.Key_Up || e.key === Qt.Key_Down)
+                    && e.modifiers === Qt.NoModifier
+                    && root.recall(e.key === Qt.Key_Up ? 1 : -1)) {
+                    e.accepted = true;
+                    return;
+                }
                 const t = e.text;
                 const dialable = t.length === 1
                     && ((t >= "0" && t <= "9") || t === "*" || t === "#"
@@ -407,7 +488,11 @@ Window {
                     e.accepted = true;
                     return;
                 }
+                /* Not on its way up from a field: an entry lets Return
+                   through after acting on it, and Enter in the contact
+                   search dialled whatever the number held. */
                 if ((e.key === Qt.Key_Return || e.key === Qt.Key_Enter)
+                    && !(root.activeFocusItem instanceof TextInput)
                     && !CoreBridge.inCall && root.dialTarget !== "") {
                     root.dial();
                     e.accepted = true;
@@ -760,6 +845,14 @@ Window {
                                                 selectByMouse: true
                                                 clip: true
                                                 focus: Qt.platform.os !== "android"
+                                                Keys.onPressed: function(e) {
+                                                    if ((e.key === Qt.Key_Up
+                                                         || e.key === Qt.Key_Down)
+                                                        && e.modifiers === Qt.NoModifier
+                                                        && root.recall(
+                                                            e.key === Qt.Key_Up ? 1 : -1))
+                                                        e.accepted = true;
+                                                }
                                                 onAccepted: if (!CoreBridge.inCall
                                                                 && root.dialTarget !== "")
                                                                 root.dial()
@@ -803,13 +896,16 @@ Window {
                                             verticalAlignment: Text.AlignVCenter
                                             Text { id: fontProbe; visible: false; text: " "
                                                    font: uriLine.font }
-                                            text: !CoreBridge.inCall ? ""
+                                            text: !CoreBridge.inCall ? root.recallNote
                                                   : CoreBridge.ringing ? CoreBridge.remoteUri
                                                   : CoreBridge.remoteUser
                                                     + (CoreBridge.codec !== ""
                                                        ? "  ·  " + CoreBridge.codec : "")
-                                            color: CoreBridge.muted
-                                            font.pixelSize: 11
+                                            readonly property bool recalled:
+                                                !CoreBridge.inCall && root.recallNote !== ""
+                                            color: recalled ? CoreBridge.accent : CoreBridge.muted
+                                            font.pixelSize: recalled ? 13 : 11
+                                            font.weight: recalled ? Font.DemiBold : Font.Normal
                                             wrapMode: Text.Wrap
                                         }
                                         /* The largest thing on the screen, and

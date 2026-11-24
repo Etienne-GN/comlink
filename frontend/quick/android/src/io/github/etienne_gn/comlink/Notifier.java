@@ -1,11 +1,13 @@
 package io.github.etienne_gn.comlink;
 
+import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Build;
 
 /* What the phone says when the window is not on screen.
@@ -28,6 +30,25 @@ public final class Notifier {
 
     private static final String CHANNEL = "comlink.incoming";
     private static final int NOTE_ID = 2;
+
+    /* Android 13 and up show nothing from an application that was not
+       granted this at runtime, and the heads-up is the only sign of an
+       incoming call while the window is away. */
+    public static void askPermission(final Context ctx) {
+        if (Build.VERSION.SDK_INT < 33 || !(ctx instanceof Activity))
+            return;
+        final String perm = "android.permission.POST_NOTIFICATIONS";
+        if (ctx.checkSelfPermission(perm)
+                == PackageManager.PERMISSION_GRANTED)
+            return;
+        final Activity activity = (Activity) ctx;
+        activity.runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                activity.requestPermissions(new String[] { perm }, 1);
+            }
+        });
+    }
 
     private static NotificationManager manager(Context ctx) {
         NotificationManager nm =

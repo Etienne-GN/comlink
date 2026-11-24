@@ -190,11 +190,17 @@ CoreBridge::CoreBridge(QObject *parent) : QObject(parent) {
                   + QStringLiteral("/comlink.yaml")
             : g_configPath;
     const QString dir = QFileInfo(cfg).absolutePath();
-    QDir().mkpath(dir);
+    /* Ours alone when we are the ones making it; a directory the
+       operator pointed --config at is theirs to set. */
+    if (!QDir(dir).exists() && QDir().mkpath(dir))
+        QFile::setPermissions(dir, QFileDevice::ReadOwner
+                                       | QFileDevice::WriteOwner
+                                       | QFileDevice::ExeOwner);
 
     if (!QFile::exists(cfg)) {
         QFile f(cfg);
         if (f.open(QIODevice::WriteOnly)) {
+            f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
             f.write("log_level: 3\nsip_port: 0\n");
             f.write(QStringLiteral("db_file: %1/comlink.db\n")
                         .arg(dir).toUtf8());
@@ -545,6 +551,7 @@ qlonglong CoreBridge::saveAccount(qlonglong id, const QVariantMap &form) {
                           .arg(QString::fromUtf8(sp_strerror(st)),
                                QString::fromUtf8(sp_last_error_detail(m_core)))
                           .trimmed();
+        emit lastErrorChanged();
         return 0;
     }
 
@@ -562,7 +569,11 @@ qlonglong CoreBridge::saveAccount(qlonglong id, const QVariantMap &form) {
 
     QString secretProblem;
     if (keepSecret) {
-        const QString name = form.value("id").toString().trimmed();
+        /* What the account is called now, not what the form asked for:
+           after a refused rename those differ, and the password filed
+           under the name it did not get overwrote the entry of the
+           account that has it. */
+        const QString name = str(sp_account_id_of(m_core, out));
         const QString key = secretKey(name);
         /* An empty field is only an instruction to forget the
            password when the form knew what the password was. If the
@@ -1969,7 +1980,9 @@ QVariantList CoreBridge::siplog(const QString &callId, int limit) const {
     if (sp_siplog_read(m_core, c.isEmpty() ? nullptr : c.constData(),
                        (size_t)limit, &rows, &n) != SP_OK)
         return out;
+    m_sipRaw.clear();
     for (size_t i = 0; i < n; i++) {
+        m_sipRaw.append(QString::fromUtf8(rows[i].raw ? rows[i].raw : ""));
         QVariantMap m;
         m["index"] = (int)i;
         m["tsUs"] = (qulonglong)rows[i].ts_us;
@@ -1985,19 +1998,13 @@ QVariantList CoreBridge::siplog(const QString &callId, int limit) const {
     return out;
 }
 
-/* The full text of one message, fetched only when it is opened: the
-   list holds thousands and the raw of each is a kilobyte. */
-QString CoreBridge::sipMessageAt(const QString &callId, int index) const {
-    if (!m_core)
-        return QString();
-    const sp_sip_message *rows = nullptr;
-    size_t n = 0;
-    const QByteArray c = callId.toUtf8();
-    if (sp_siplog_read(m_core, c.isEmpty() ? nullptr : c.constData(),
-                       (size_t)index + 1, &rows, &n) != SP_OK
-        || (size_t)index >= n)
-        return QString();
-    return QString::fromUtf8(rows[index].raw ? rows[index].raw : "");
+/* The full text of one message of the list siplog() last returned,
+   kept from that read. Asking the log again by position showed another
+   message's text under the row that was clicked, as soon as a message
+   had arrived or the filter field had changed since. */
+QString CoreBridge::sipMessageAt(const QString &, int index) const {
+    return index >= 0 && index < m_sipRaw.size() ? m_sipRaw.at(index)
+                                                 : QString();
 }
 
 bool CoreBridge::playbackStart(const QString &path) {

@@ -97,11 +97,15 @@ Item {
         }
         const adding = root.editing === 0;
         const saved = CoreBridge.saveAccount(root.editing, root.form());
-        if (saved === 0)
-            root.failed((adding ? "Adding the account"
-                                : "Updating the account")
-                        + " failed.\n\n" + CoreBridge.lastError);
-        else if (CoreBridge.lastError !== "")
+        if (saved === 0) {
+            /* Kept open, with the reason beside the form: closing it
+               threw away twelve fields over one of them. */
+            root.problem = (adding ? "Adding the account"
+                                   : "Updating the account")
+                           + " failed. " + CoreBridge.lastError;
+            return;
+        }
+        if (CoreBridge.lastError !== "")
             root.failed(CoreBridge.lastError);
         if (root.host)
             root.host.close();

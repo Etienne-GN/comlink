@@ -599,6 +599,7 @@ private:
     bool     m_registered = false;
     QString  m_regDetail;
     QString  m_lastError;
+    mutable QStringList m_sipRaw;
     /* The picture being chosen, decoded once and cropped on commit. */
     QImage   m_staged;
 

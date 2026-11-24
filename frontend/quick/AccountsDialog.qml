@@ -30,6 +30,10 @@ Item {
             currentIndex = 0;
     }
     Component.onCompleted: root.reload()
+    Connections {
+        target: CoreBridge
+        function onAccountChanged() { root.reload() }
+    }
 
     function openEditor(id) {
         root.editingId = id;

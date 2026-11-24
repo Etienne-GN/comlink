@@ -81,6 +81,7 @@ static void useSoftwareIfOffscreen() {
 
 #ifdef Q_OS_ANDROID
 #include <QJniEnvironment>
+#include <QJniObject>
 #include "comlink/core.h"
 #include <android/log.h>
 #include <cstring>
@@ -248,9 +249,25 @@ int main(int argc, char *argv[]) {
        in the middle of answering a call is a lost call. Qt answers
        Undetermined on platforms with no such concept, which is the
        desktop, so this is a no-op there. */
+    /* One dialog at a time: Android drops a request made while another
+       is still on screen, so the notification permission is asked for
+       once the microphone's has been answered. */
+    const auto askNotifications = []() {
+#ifdef Q_OS_ANDROID
+        QJniObject ctx = QNativeInterface::QAndroidApplication::context();
+        if (ctx.isValid())
+            QJniObject::callStaticMethod<void>(
+                "io/github/etienne_gn/comlink/Notifier", "askPermission",
+                "(Landroid/content/Context;)V", ctx.object());
+#endif
+    };
     QMicrophonePermission mic;
     if (qApp->checkPermission(mic) == Qt::PermissionStatus::Undetermined)
-        qApp->requestPermission(mic, [](const QPermission &) {});
+        qApp->requestPermission(mic, [askNotifications](const QPermission &) {
+            askNotifications();
+        });
+    else
+        askNotifications();
 
     QQmlApplicationEngine engine;
     engine.loadFromModule("comlink", "Main");
@@ -279,7 +296,7 @@ int main(int argc, char *argv[]) {
     /* COMLINK_QUICK_KEYS types into the window before the shot is
        taken, so the keyboard path can be exercised without a human at
        one. Comma-separated: a single character is that key, and
-       Return, Escape, Backspace and Tab are named. A "Ctrl+" prefix
+       Return, Escape, Backspace, Up, Down and Tab are named. A "Ctrl+" prefix
        adds the modifier; "Shift+Tab" is sent as the Backtab Qt makes
        of it.
 
@@ -315,6 +332,10 @@ int main(int argc, char *argv[]) {
                     key = Qt::Key_Escape;
                 } else if (spec == QStringLiteral("Backspace")) {
                     key = Qt::Key_Backspace;
+                } else if (spec == QStringLiteral("Up")) {
+                    key = Qt::Key_Up;
+                } else if (spec == QStringLiteral("Down")) {
+                    key = Qt::Key_Down;
                 } else if (spec == QStringLiteral("Tab")) {
                     key = Qt::Key_Tab;
                 } else if (spec == QStringLiteral("Shift+Tab")) {

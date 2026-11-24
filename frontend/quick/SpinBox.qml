@@ -35,8 +35,17 @@ Item {
             root.value = c;
             root.edited(c);
         }
-        input.text = root.displayText();
+        root.sync();
     }
+    /* The entry's text is assigned, never bound: a binding dies at the
+       first assignment, and the entry then kept showing one codec's
+       number after the page had moved the value to another's. */
+    function sync() { input.text = root.displayText() }
+    onValueChanged: sync()
+    onFromChanged: sync()
+    onSuffixChanged: sync()
+    onSpecialValueTextChanged: sync()
+    Component.onCompleted: sync()
 
     /* What was typed and not yet committed, for a Save that is clicked
        while the entry still holds focus: a QSpinBox's value() already
@@ -80,7 +89,6 @@ Item {
         font.pointSize: CoreBridge.basePt
         selectByMouse: true
         enabled: root.enabled
-        text: root.displayText()
         onEditingFinished: {
             const n = parseInt(text, 10);
             if (!isNaN(n))

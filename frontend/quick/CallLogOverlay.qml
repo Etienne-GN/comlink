@@ -53,12 +53,12 @@ Rectangle {
     }
     function showTranscript() { transcriptView.show(row.id, row.remote) }
     function reload() {
-        const keep = row ? row.remote : "";
+        const keep = row ? row.id : -1;
         rows = CoreBridge.history(200);
         let restore = -1;
-        if (keep !== "")
+        if (keep !== -1)
             for (let i = 0; i < rows.length; i++)
-                if (rows[i].remote === keep) { restore = i; break }
+                if (rows[i].id === keep) { restore = i; break }
         current = restore;
         refreshPlayback();
     }

@@ -24,17 +24,37 @@ static void remove_all(pjsip_msg *msg, const char *name) {
     }
 }
 
+/* The headers the rules put on one outgoing message, kept with it so
+   the next pass over the same message can take them off first. */
+typedef struct {
+    pjsip_hdr *h[SP_MAX_ACTIONS_PER_MESSAGE];
+    unsigned   n;
+} sp_added;
+
 static void add_header(pj_pool_t *pool, pjsip_msg *msg, const char *name,
-                       const char *value) {
+                       const char *value, sp_added *track) {
     pj_str_t n = pj_str((char *)name);
     pj_str_t v = pj_str((char *)value);
     pjsip_generic_string_hdr *h = pjsip_generic_string_hdr_create(pool, &n, &v);
-    if (h)
-        pjsip_msg_add_hdr(msg, (pjsip_hdr *)h);
+    if (!h)
+        return;
+    pjsip_msg_add_hdr(msg, (pjsip_hdr *)h);
+    if (track && track->n < SP_MAX_ACTIONS_PER_MESSAGE)
+        track->h[track->n++] = (pjsip_hdr *)h;
+}
+
+static void take_off(pjsip_msg *msg, sp_added *track) {
+    for (unsigned i = 0; i < track->n; i++)
+        for (pjsip_hdr *h = msg->hdr.next; h != &msg->hdr; h = h->next)
+            if (h == track->h[i]) {
+                pj_list_erase(h);
+                break;
+            }
+    track->n = 0;
 }
 
 static void apply(pj_pool_t *pool, pjsip_msg *msg,
-                  const sp_hdr_action **acts, size_t n) {
+                  const sp_hdr_action **acts, size_t n, sp_added *track) {
     for (size_t i = 0; i < n; i++) {
         switch (acts[i]->kind) {
         case SP_ACT_REMOVE:
@@ -44,10 +64,10 @@ static void apply(pj_pool_t *pool, pjsip_msg *msg,
             /* Replace: a later set on the same name must win, per the
                documented rule semantics. */
             remove_all(msg, acts[i]->name);
-            add_header(pool, msg, acts[i]->name, acts[i]->value);
+            add_header(pool, msg, acts[i]->name, acts[i]->value, NULL);
             break;
         case SP_ACT_ADD:
-            add_header(pool, msg, acts[i]->name, acts[i]->value);
+            add_header(pool, msg, acts[i]->name, acts[i]->value, track);
             break;
         }
     }
@@ -89,7 +109,7 @@ static const char *account_of(sp_core *core, pjsip_msg *msg, char *buf,
 }
 
 static void run_rules(sp_core *core, pj_pool_t *pool, pjsip_msg *msg,
-                      sp_direction dir) {
+                      sp_direction dir, sp_added *track) {
     if (!core || !core->cfg || core->cfg->n_rules == 0)
         return;
 
@@ -127,7 +147,7 @@ static void run_rules(sp_core *core, pj_pool_t *pool, pjsip_msg *msg,
         return;   /* too many actions for one message; leave it untouched */
     if (n == 0)
         return;
-    apply(pool, msg, acts, n);
+    apply(pool, msg, acts, n, track);
 }
 
 /* Capture after the rules have run, so the log shows what actually
@@ -189,15 +209,22 @@ static void capture(sp_core *core, pjsip_msg *msg, const char *direction) {
 
 static pjsip_module sp_mod;
 
-/* Once per message, not once per send: pjsip comes through here again
-   for every retransmission and for the request re-sent with
-   credentials after a 401, with the same message, and an "add" applied
-   each time piled its header up. */
+/* pjsip comes through here on every send of a message, not once per
+   message: each retransmission, the request re-sent with credentials
+   after a 401, and a response object reused for the next response of
+   the same transaction, 180 then 200. The rules run every time, on the
+   message as it now is -- a rule matching the 200 must not be skipped
+   because the 180 went first -- and what an earlier pass added comes
+   off first, or an "add" piles its header up once per send. */
 static void tx_rules(sp_core *core, pjsip_tx_data *tdata) {
-    if (sp_mod.id < 0 || tdata->mod_data[sp_mod.id])
-        return;
-    tdata->mod_data[sp_mod.id] = core;
-    run_rules(core, tdata->pool, tdata->msg, SP_DIR_TX);
+    sp_added *track = sp_mod.id >= 0 ? tdata->mod_data[sp_mod.id] : NULL;
+    if (!track && sp_mod.id >= 0) {
+        track = PJ_POOL_ZALLOC_T(tdata->pool, sp_added);
+        tdata->mod_data[sp_mod.id] = track;
+    }
+    if (track)
+        take_off(tdata->msg, track);
+    run_rules(core, tdata->pool, tdata->msg, SP_DIR_TX, track);
     /* The message may already have been serialised into the tx buffer,
        so the cached print must be dropped or the edit never reaches
        the wire. */
@@ -225,7 +252,8 @@ static pj_status_t on_tx_response(pjsip_tx_data *tdata) {
 static pj_bool_t on_rx_request(pjsip_rx_data *rdata) {
     sp_core *core = g_mod_core;
     if (core) {
-        run_rules(core, rdata->tp_info.pool, rdata->msg_info.msg, SP_DIR_RX);
+        run_rules(core, rdata->tp_info.pool, rdata->msg_info.msg, SP_DIR_RX,
+                  NULL);
         capture(core, rdata->msg_info.msg, "rx");
     }
     return PJ_FALSE;   /* let pjsua carry on handling it */
@@ -234,7 +262,8 @@ static pj_bool_t on_rx_request(pjsip_rx_data *rdata) {
 static pj_bool_t on_rx_response(pjsip_rx_data *rdata) {
     sp_core *core = g_mod_core;
     if (core) {
-        run_rules(core, rdata->tp_info.pool, rdata->msg_info.msg, SP_DIR_RX);
+        run_rules(core, rdata->tp_info.pool, rdata->msg_info.msg, SP_DIR_RX,
+                  NULL);
         capture(core, rdata->msg_info.msg, "rx");
     }
     return PJ_FALSE;

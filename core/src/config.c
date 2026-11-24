@@ -4,7 +4,9 @@
 #include "yaml_tree.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1078,9 +1080,18 @@ sp_status sp_config_save(const sp_config *cfg, const char *path,
         return SP_ERR_CONFIG;
     }
 
-    FILE *f = fopen(tmp, "we");
+    /* The owner's alone, whatever the umask and whatever a leftover
+       from an interrupted save was: account passwords are in here when
+       no keyring holds them. */
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    FILE *f = NULL;
+    if (fd >= 0 && fchmod(fd, 0600) == 0)
+        f = fdopen(fd, "w");
     if (!f) {
         snprintf(err, errlen, "cannot write %s: %s", tmp, strerror(errno));
+        if (fd >= 0)
+            close(fd);
         return SP_ERR_CONFIG;
     }
 

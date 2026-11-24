@@ -370,19 +370,26 @@ sp_status sp_media_get_codecs(sp_core *core, const sp_codec_params **out,
     if (pst != PJ_SUCCESS)
         return sp_core_fail(core, pst, SP_ERR_MEDIA, "pjsua_enum_codecs");
 
+    /* One block: the array followed by the ids it points at. pjsua
+       writes each id into the info array above, which is this
+       function's own stack. */
+    size_t bytes = (count ? count : 1) * sizeof *core->codec_params;
+    for (unsigned i = 0; i < count; i++)
+        bytes += (size_t)info[i].codec_id.slen + 1;
     free(core->codec_params);
-    core->codec_params = calloc(count ? count : 1, sizeof *core->codec_params);
+    core->codec_params = calloc(1, bytes);
     if (!core->codec_params) {
         core->n_codec_params = 0;
         return SP_ERR_INTERNAL;
     }
     core->n_codec_params = count;
+    char *ids = (char *)(core->codec_params + (count ? count : 1));
 
     for (unsigned i = 0; i < count; i++) {
         sp_codec_params *p = &core->codec_params[i];
-        /* pjsua's own storage for the id outlives this call, and the
-           whole array is invalidated on the next one anyway. */
-        p->id = info[i].codec_id.ptr;
+        memcpy(ids, info[i].codec_id.ptr, (size_t)info[i].codec_id.slen);
+        p->id = ids;
+        ids += info[i].codec_id.slen + 1;
         p->priority = info[i].priority;
         p->enabled = info[i].priority > 0;
         p->bitrate = -1;

@@ -61,6 +61,11 @@ static const char *account_of(sp_core *core, pjsip_msg *msg, char *buf,
     pjsip_from_hdr *from = pjsip_msg_find_hdr(msg, PJSIP_H_FROM, NULL);
     if (!from || !from->uri)
         return NULL;
+    /* Any other scheme parses into a smaller structure, and reading
+       it as a SIP URI reads past its end. */
+    if (!PJSIP_URI_SCHEME_IS_SIP(from->uri)
+        && !PJSIP_URI_SCHEME_IS_SIPS(from->uri))
+        return NULL;
     pjsip_sip_uri *uri = pjsip_uri_get_uri(from->uri);
     if (!uri)
         return NULL;
@@ -182,15 +187,28 @@ static void capture(sp_core *core, pjsip_msg *msg, const char *direction) {
     sp_core_post(core, &ev);
 }
 
-static pj_status_t on_tx_request(pjsip_tx_data *tdata) {
-    sp_core *core = g_mod_core;
-    if (!core)
-        return PJ_SUCCESS;
+static pjsip_module sp_mod;
+
+/* Once per message, not once per send: pjsip comes through here again
+   for every retransmission and for the request re-sent with
+   credentials after a 401, with the same message, and an "add" applied
+   each time piled its header up. */
+static void tx_rules(sp_core *core, pjsip_tx_data *tdata) {
+    if (sp_mod.id < 0 || tdata->mod_data[sp_mod.id])
+        return;
+    tdata->mod_data[sp_mod.id] = core;
     run_rules(core, tdata->pool, tdata->msg, SP_DIR_TX);
     /* The message may already have been serialised into the tx buffer,
        so the cached print must be dropped or the edit never reaches
        the wire. */
     pjsip_tx_data_invalidate_msg(tdata);
+}
+
+static pj_status_t on_tx_request(pjsip_tx_data *tdata) {
+    sp_core *core = g_mod_core;
+    if (!core)
+        return PJ_SUCCESS;
+    tx_rules(core, tdata);
     capture(core, tdata->msg, "tx");
     return PJ_SUCCESS;
 }
@@ -199,8 +217,7 @@ static pj_status_t on_tx_response(pjsip_tx_data *tdata) {
     sp_core *core = g_mod_core;
     if (!core)
         return PJ_SUCCESS;
-    run_rules(core, tdata->pool, tdata->msg, SP_DIR_TX);
-    pjsip_tx_data_invalidate_msg(tdata);
+    tx_rules(core, tdata);
     capture(core, tdata->msg, "tx");
     return PJ_SUCCESS;
 }
@@ -253,9 +270,12 @@ sp_status sp_hdr_module_register(sp_core *core) {
     return SP_OK;
 }
 
-void sp_hdr_module_unregister(void) {
-    if (!g_mod_core)
-        return;
-    pjsip_endpt_unregister_module(pjsua_get_pjsip_endpt(), &sp_mod);
+/* After pjsua_destroy, which unloads the module with the endpoint.
+   Not before: pjsua_destroy is what sends the last BYEs and the
+   un-REGISTERs, and they are owed the rules and a place in the trace
+   like any other message. */
+void sp_hdr_module_detach(void) {
     g_mod_core = NULL;
+    sp_mod.id = -1;
+    sp_mod.prev = sp_mod.next = NULL;
 }

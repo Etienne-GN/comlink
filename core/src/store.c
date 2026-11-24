@@ -1,7 +1,11 @@
 #include "store.h"
 
+#include <fcntl.h>
 #include <sqlite3.h>
+#include <stdbool.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -228,6 +232,16 @@ sp_store *sp_store_open(const char *path, char *err, size_t errlen) {
     if (!s) {
         snprintf(err, errlen, "out of memory");
         return NULL;
+    }
+
+    /* The owner's alone: the call history, the SIP trace, the contacts
+       and the transcripts are in here. SQLite creates its file by the
+       umask, and gives its journal the mode the database has. */
+    const bool on_disk = path[0] != ':' && strncmp(path, "file:", 5) != 0;
+    int fd = on_disk ? open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600) : -1;
+    if (fd >= 0) {
+        fchmod(fd, 0600);
+        close(fd);
     }
 
     int rc = sqlite3_open_v2(path, &s->db,

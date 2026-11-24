@@ -46,6 +46,12 @@ typedef struct {
 
 struct sp_yaml_node;
 
+/* Whether these can be written into a message as they are. pjsip
+   prints a header verbatim, so a name that is not an RFC 3261 token,
+   or a value carrying a line break, becomes headers nobody asked for. */
+bool sp_hdr_name_ok(const char *name);
+bool sp_hdr_value_ok(const char *value);
+
 sp_status sp_rules_parse(struct sp_yaml_node *seq, sp_hdr_rule **out,
                          size_t *n_out, char *err, size_t errlen);
 void      sp_rules_free(sp_hdr_rule *rules, size_t n);

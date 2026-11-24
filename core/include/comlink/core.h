@@ -758,11 +758,8 @@ sp_status sp_call_record_start(sp_core *core, sp_call_id call,
                                const char *path);
 
 /* Starts recording into a file the core names, in the configured
-   directory and format. *path_out points into core-owned storage that
-   stays valid until this call handle records again, or until the call
-   ends, whichever comes first -- the record is freed on hangup. A
-   frontend that wants to show the path after the call ends must copy
-   it before then.
+   directory and format. *path_out points into core-owned storage,
+   valid until the next sp_call_record_start_auto on this core.
 
    This is what a frontend should call. sp_call_record_start stays for
    a caller that genuinely has a path of its own, which is the CLI
@@ -770,6 +767,8 @@ sp_status sp_call_record_start(sp_core *core, sp_call_id call,
 sp_status sp_call_record_start_auto(sp_core *core, sp_call_id call,
                                     const char **path_out);
 sp_status sp_call_record_stop(sp_core *core, sp_call_id call);
+/* The strings in *out point into core-owned storage, valid until the
+   next sp_call_get_info on this core. */
 sp_status sp_call_get_info(sp_core *core, sp_call_id call,
                            sp_call_info *out);
 

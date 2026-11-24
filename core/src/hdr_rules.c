@@ -19,6 +19,27 @@ static int known(const char *const *set, const char *key) {
     return 0;
 }
 
+bool sp_hdr_name_ok(const char *name) {
+    if (!name || !*name)
+        return false;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        const bool alnum = (*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z')
+                           || (*p >= 'a' && *p <= 'z');
+        if (!alnum && !strchr("-.!%*_+`'~", *p))
+            return false;
+    }
+    return true;
+}
+
+bool sp_hdr_value_ok(const char *value) {
+    if (!value)
+        return false;
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++)
+        if ((*p < 0x20 && *p != '\t') || *p == 0x7f)
+            return false;
+    return true;
+}
+
 static void action_free(sp_hdr_action *a) {
     free(a->name);
     free(a->value);
@@ -61,7 +82,7 @@ static sp_status parse_action(sp_yaml_node *node, sp_hdr_action *out,
 
     if (strcmp(key, "remove") == 0) {
         const char *name = sp_yaml_scalar(val);
-        if (!name || !*name) {
+        if (!sp_hdr_name_ok(name)) {
             snprintf(err, errlen,
                      "line %d: rule \"%s\": remove needs a header name",
                      sp_yaml_line(node), rule_name);
@@ -78,6 +99,13 @@ static sp_status parse_action(sp_yaml_node *node, sp_hdr_action *out,
     if (!name || !*name || !value) {
         snprintf(err, errlen,
                  "line %d: rule \"%s\": %s needs name and value",
+                 sp_yaml_line(node), rule_name, key);
+        return SP_ERR_CONFIG;
+    }
+    if (!sp_hdr_name_ok(name) || !sp_hdr_value_ok(value)) {
+        snprintf(err, errlen,
+                 "line %d: rule \"%s\": %s has a header name that is not a "
+                 "token, or a value with a control character",
                  sp_yaml_line(node), rule_name, key);
         return SP_ERR_CONFIG;
     }

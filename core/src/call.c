@@ -19,14 +19,41 @@
 /* Room for the per-call ad-hoc headers a frontend may attach. */
 #define SP_MAX_EXTRA_HEADERS 32
 
-static void refresh_party(sp_call_rec *rec, pjsua_call_id native,
-                          const pjsua_call_info *ci);
+/* Guards every call record: its fields, and its leaving the table and
+   being freed, which a pjsip thread does at DISCONNECTED while API
+   threads are still asking about the call. A record pointer is only
+   good while this is held.
+ *
+ * A leaf: no pjsua call and no other core lock is taken while holding
+ * it. pjsua holds PJSUA_LOCK across some callbacks, so a thread that
+ * called into pjsua with this held would deadlock against a callback
+ * waiting for it. One core per process (core.c), so one lock. */
+static pthread_mutex_t g_rec_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void refresh_party(sp_call_rec *rec, const pjsua_call_info *ci,
+                          const char *codec);
+
+/* Caller holds g_rec_lock. */
 static sp_call_rec *rec_of(sp_core *core, sp_call_id call, int *native) {
     void *data = NULL;
     if (sp_ht_lookup(core->calls, call, native, &data) != 0)
         return NULL;
     return data;
+}
+
+static bool native_of(sp_core *core, sp_call_id call, int *native) {
+    return sp_ht_lookup(core->calls, call, native, NULL) == 0;
+}
+
+static void stream_codec(pjsua_call_id native, char *out, size_t outlen) {
+    out[0] = '\0';
+    pjsua_stream_info si;
+    if (pjsua_call_get_stream_info(native, 0, &si) == PJ_SUCCESS &&
+        si.type == PJMEDIA_TYPE_AUDIO &&
+        si.info.aud.fmt.encoding_name.slen > 0)
+        snprintf(out, outlen, "%.*s",
+                 (int)si.info.aud.fmt.encoding_name.slen,
+                 si.info.aud.fmt.encoding_name.ptr);
 }
 
 static sp_status not_found(sp_core *core, sp_call_id call) {
@@ -58,6 +85,12 @@ static sp_status build_msg_data(sp_core *core, const sp_header *extra,
         if (!extra[i].name || !*extra[i].name || !extra[i].value) {
             pj_pool_release(pool);
             sp_core_detail(core, "ad-hoc header %zu has an empty name or value", i);
+            return SP_ERR_INVALID_ARG;
+        }
+        if (!sp_hdr_name_ok(extra[i].name) || !sp_hdr_value_ok(extra[i].value)) {
+            pj_pool_release(pool);
+            sp_core_detail(core, "ad-hoc header %zu has a name that is not a "
+                           "token, or a value with a control character", i);
             return SP_ERR_INVALID_ARG;
         }
         pj_str_t name = pj_str((char *)extra[i].name);
@@ -159,15 +192,20 @@ sp_status sp_call_make(sp_core *core, sp_account_id acc, const char *uri,
         * The callback runs on this thread, inside the call above, so
         * the record is either still in the table or gone for good --
         * there is no window between the two. */
-        void *live = NULL;
-        if (sp_ht_lookup(core->calls, handle, NULL, &live) == 0
-            && live == rec) {
-            /* The record stays: a call that failed to place is history
-               too, and hiding it would make the log lie about what
-               happened. */
-            if (rec->history_id > 0)
-                sp_history_ended(core->history, rec->history_id, 0, 0);
+        pthread_mutex_lock(&g_rec_lock);
+        int64_t history_id = 0;
+        const bool live = rec_of(core, handle, NULL) == rec;
+        if (live) {
+            history_id = rec->history_id;
             sp_ht_retire(core->calls, handle);
+        }
+        pthread_mutex_unlock(&g_rec_lock);
+        if (live) {
+            /* The history row stays: a call that failed to place is
+               history too, and hiding it would make the log lie about
+               what happened. */
+            if (history_id > 0)
+                sp_history_ended(core->history, history_id, 0, 0);
             free(rec);
         }
         char what[256];
@@ -175,8 +213,14 @@ sp_status sp_call_make(sp_core *core, sp_account_id acc, const char *uri,
         return sp_core_fail(core, st, SP_ERR_TRANSPORT, what);
     }
 
-    rec->native = native;
-    sp_ht_set_native(core->calls, handle, native);
+    /* The call may already have ended on the SIP thread, and the
+       record with it; the handle is returned all the same, retired. */
+    pthread_mutex_lock(&g_rec_lock);
+    if (rec_of(core, handle, NULL) == rec) {
+        rec->native = native;
+        sp_ht_set_native(core->calls, handle, native);
+    }
+    pthread_mutex_unlock(&g_rec_lock);
     *out = handle;
     return SP_OK;
 }
@@ -187,7 +231,7 @@ sp_status sp_call_answer(sp_core *core, sp_call_id call, int code,
     if (code < 100 || code > 699)
         return SP_ERR_INVALID_ARG;
     int native = PJSUA_INVALID_ID;
-    if (!rec_of(core, call, &native))
+    if (!native_of(core, call, &native))
         return not_found(core, call);
 
     pj_pool_t *pool = NULL;
@@ -213,7 +257,7 @@ sp_status sp_call_answer(sp_core *core, sp_call_id call, int code,
 sp_status sp_call_hangup(sp_core *core, sp_call_id call, int code) {
     SP_ENTRY(core);
     int native = PJSUA_INVALID_ID;
-    if (!rec_of(core, call, &native))
+    if (!native_of(core, call, &native))
         return not_found(core, call);
     pj_status_t st = pjsua_call_hangup(native, (unsigned)code, NULL, NULL);
     if (st != PJ_SUCCESS)
@@ -224,8 +268,7 @@ sp_status sp_call_hangup(sp_core *core, sp_call_id call, int code) {
 sp_status sp_call_set_hold(sp_core *core, sp_call_id call, bool hold) {
     SP_ENTRY(core);
     int native = PJSUA_INVALID_ID;
-    sp_call_rec *rec = rec_of(core, call, &native);
-    if (!rec)
+    if (!native_of(core, call, &native))
         return not_found(core, call);
 
     pj_status_t st;
@@ -237,7 +280,11 @@ sp_status sp_call_set_hold(sp_core *core, sp_call_id call, bool hold) {
         return sp_core_fail(core, st, SP_ERR_MEDIA,
                             hold ? "pjsua_call_set_hold"
                                  : "pjsua_call_reinvite (unhold)");
-    rec->on_hold = hold;
+    pthread_mutex_lock(&g_rec_lock);
+    sp_call_rec *rec = rec_of(core, call, NULL);
+    if (rec)
+        rec->on_hold = hold;
+    pthread_mutex_unlock(&g_rec_lock);
     return SP_OK;
 }
 
@@ -246,7 +293,10 @@ sp_status sp_call_xfer_blind(sp_core *core, sp_call_id call, const char *uri) {
     if (!uri || !*uri)
         return SP_ERR_INVALID_ARG;
     int native = PJSUA_INVALID_ID;
+    pthread_mutex_lock(&g_rec_lock);
     sp_call_rec *rec = rec_of(core, call, &native);
+    const sp_account_id acc = rec ? rec->acc : 0;
+    pthread_mutex_unlock(&g_rec_lock);
     if (!rec)
         return not_found(core, call);
     /* An operator types "6043" here exactly as on the dialpad. Sent
@@ -254,7 +304,7 @@ sp_status sp_call_xfer_blind(sp_core *core, sp_call_id call, const char *uri) {
        202 and then never acts on, so the target is completed against
        the call's own account, the same way a dialled number is. */
     char target[512];
-    sp_status cs = sp_call_uri_complete(core, rec->acc, uri,
+    sp_status cs = sp_call_uri_complete(core, acc, uri,
                                         target, sizeof target);
     if (cs != SP_OK) {
         sp_core_detail(core, "transfer target \"%s\" cannot be completed "
@@ -275,9 +325,9 @@ sp_status sp_call_xfer_attended(sp_core *core, sp_call_id a, sp_call_id b) {
     if (a == b)
         return SP_ERR_INVALID_ARG;
     int na = PJSUA_INVALID_ID, nb = PJSUA_INVALID_ID;
-    if (!rec_of(core, a, &na))
+    if (!native_of(core, a, &na))
         return not_found(core, a);
-    if (!rec_of(core, b, &nb))
+    if (!native_of(core, b, &nb))
         return not_found(core, b);
     pj_status_t st = pjsua_call_xfer_replaces(na, nb, 0, NULL);
     if (st != PJ_SUCCESS)
@@ -304,7 +354,7 @@ sp_status sp_call_send_dtmf(sp_core *core, sp_call_id call,
     if (!digits || !*digits || !is_dtmf(digits))
         return SP_ERR_INVALID_ARG;
     int native = PJSUA_INVALID_ID;
-    if (!rec_of(core, call, &native))
+    if (!native_of(core, call, &native))
         return not_found(core, call);
     pj_str_t d = pj_str((char *)digits);
     pj_status_t st = pjsua_call_dial_dtmf(native, &d);
@@ -313,26 +363,69 @@ sp_status sp_call_send_dtmf(sp_core *core, sp_call_id call,
     return SP_OK;
 }
 
-static void recorder_stop(sp_call_rec *rec) {
-    if (!rec)
-        return;
-    if (rec->recorder != PJSUA_INVALID_ID) {
-        pjsua_recorder_destroy(rec->recorder);
-        rec->recorder = PJSUA_INVALID_ID;
-    }
-    if (rec->rec_port) {
+/* A call's recorder, off the record: taken under g_rec_lock, destroyed
+   after letting it go, because destroying is a pjsua call. */
+typedef struct {
+    pjsua_recorder_id  recorder;
+    pjmedia_port      *port;
+    pj_pool_t         *pool;
+    pjsua_conf_port_id slot;
+} rec_writer;
+
+/* Caller holds g_rec_lock. */
+static rec_writer writer_take(sp_call_rec *rec) {
+    rec_writer w = { rec->recorder, rec->rec_port, rec->rec_pool,
+                     rec->rec_slot };
+    rec->recorder = PJSUA_INVALID_ID;
+    rec->rec_port = NULL;
+    rec->rec_pool = NULL;
+    rec->rec_slot = PJSUA_INVALID_ID;
+    return w;
+}
+
+static void writer_destroy(const rec_writer *w) {
+    if (w->recorder != PJSUA_INVALID_ID)
+        pjsua_recorder_destroy(w->recorder);
+    if (w->port) {
         /* Mirrors pjsua_recorder_destroy's own order (pjsua_aud.c):
            remove from the bridge, then destroy the port -- which runs
            on_destroy and is what finalises the Ogg stream -- then
            release the pool pjsua_conf_add_port needed kept alive
            while the port sat in the bridge. */
-        pjsua_conf_remove_port(rec->rec_slot);
-        pjmedia_port_destroy(rec->rec_port);
-        pj_pool_release(rec->rec_pool);
-        rec->rec_port = NULL;
-        rec->rec_pool = NULL;
-        rec->rec_slot = PJSUA_INVALID_ID;
+        pjsua_conf_remove_port(w->slot);
+        pjmedia_port_destroy(w->port);
+        pj_pool_release(w->pool);
     }
+}
+
+/* Hands a writer built outside the lock to the record. The call may
+   have ended, or another thread started recording it, in between; then
+   the writer is destroyed and the status says which. */
+static sp_status writer_attach(sp_core *core, sp_call_id call,
+                               const rec_writer *w, const char *path) {
+    sp_status st = SP_OK;
+    int64_t history_id = 0;
+    pthread_mutex_lock(&g_rec_lock);
+    sp_call_rec *rec = rec_of(core, call, NULL);
+    if (!rec) {
+        st = SP_ERR_NOT_FOUND;
+    } else if (rec->recorder != PJSUA_INVALID_ID || rec->rec_port) {
+        st = SP_ERR_STATE;
+    } else {
+        rec->recorder = w->recorder;
+        rec->rec_port = w->port;
+        rec->rec_pool = w->pool;
+        rec->rec_slot = w->slot;
+        history_id = rec->history_id;
+    }
+    pthread_mutex_unlock(&g_rec_lock);
+    if (st != SP_OK) {
+        writer_destroy(w);
+        return st == SP_ERR_NOT_FOUND ? not_found(core, call) : st;
+    }
+    if (history_id > 0)
+        sp_history_recording(core->history, history_id, path);
+    return SP_OK;
 }
 
 sp_status sp_call_record_start(sp_core *core, sp_call_id call,
@@ -347,12 +440,17 @@ sp_status sp_call_record_start(sp_core *core, sp_call_id call,
     if (!path || !*path)
         return SP_ERR_INVALID_ARG;
     int native = PJSUA_INVALID_ID;
+    pthread_mutex_lock(&g_rec_lock);
     sp_call_rec *rec = rec_of(core, call, &native);
+    const bool busy = rec && (rec->recorder != PJSUA_INVALID_ID
+                              || rec->rec_port != NULL);
+    pthread_mutex_unlock(&g_rec_lock);
     if (!rec)
         return not_found(core, call);
-    if (rec->recorder != PJSUA_INVALID_ID || rec->rec_port != NULL)
+    if (busy)
         return SP_ERR_STATE;
 
+    rec_writer w = { PJSUA_INVALID_ID, NULL, NULL, PJSUA_INVALID_ID };
     pjsua_call_info ci;
     if (pjsua_call_get_info(native, &ci) != PJ_SUCCESS ||
         ci.conf_slot == PJSUA_INVALID_ID)
@@ -389,12 +487,10 @@ sp_status sp_call_record_start(sp_core *core, sp_call_id call,
             pj_pool_release(pool);
             return SP_ERR_MEDIA;
         }
-        rec->rec_port = oport;
-        rec->rec_pool = pool;
-        rec->rec_slot = slot;
-        if (rec->history_id > 0)
-            sp_history_recording(core->history, rec->history_id, path);
-        return SP_OK;
+        w.port = oport;
+        w.pool = pool;
+        w.slot = slot;
+        return writer_attach(core, call, &w, path);
     }
 
     pj_str_t file = pj_str((char *)path);
@@ -420,33 +516,16 @@ sp_status sp_call_record_start(sp_core *core, sp_call_id call,
         pjsua_recorder_destroy(id);
         return SP_ERR_MEDIA;
     }
-    rec->recorder = id;
-    if (rec->history_id > 0)
-        sp_history_recording(core->history, rec->history_id, path);
-    return SP_OK;
+    w.recorder = id;
+    return writer_attach(core, call, &w, path);
 }
 
-/* sp_call_record_start's own SP_ENTRY only null-checks core and
-   idempotently registers the calling thread with pjlib -- it takes no
-   lock, so calling sp_call_record_start from inside a function that
-   has already run SP_ENTRY itself is safe to nest. */
-sp_status sp_call_record_start_auto(sp_core *core, sp_call_id call,
-                                    const char **path_out) {
-    if (core && !sp_config_module_enabled(core->cfg, SP_MODULE_RECORDING)) {
-        sp_core_detail(core, "the recording module is switched off");
-        return SP_ERR_DISABLED;
-    }
-    SP_ENTRY(core);
-    if (!path_out)
-        return SP_ERR_INVALID_ARG;
-
-    /* Looked up again inside sp_call_record_start below: deliberate,
-       not an oversight. call.c already accepts that a concurrent
-       hangup can free rec between two lookups in the same operation
-       (see the other SP_ENTRY callers in this file); this is that
-       same, already-accepted window. */
-    sp_call_rec *rec = rec_of(core, call, NULL);
-    if (!rec)
+/* Names the file and records into it. The path goes to the caller's
+   buffer, so the SIP thread starting an automatic recording and an API
+   thread starting one by hand do not share one. */
+static sp_status record_start_named(sp_core *core, sp_call_id call,
+                                    char *path, size_t pathlen) {
+    if (!native_of(core, call, NULL))
         return not_found(core, call);
 
     const char *dir = NULL;
@@ -460,19 +539,32 @@ sp_status sp_call_record_start_auto(sp_core *core, sp_call_id call,
         return SP_ERR_IO;
     }
 
-    if (sp_recording_path(rec->rec_path, sizeof rec->rec_path, dir,
-                          (unsigned long long)call,
+    if (sp_recording_path(path, pathlen, dir, (unsigned long long)call,
                           core->cfg->recording_format) != 0) {
         sp_core_detail(core,
             "the configured recording directory is too long for a "
             "recording path");
         return SP_ERR_IO;
     }
+    return sp_call_record_start(core, call, path);
+}
 
-    sp_status st = sp_call_record_start(core, call, rec->rec_path);
+sp_status sp_call_record_start_auto(sp_core *core, sp_call_id call,
+                                    const char **path_out) {
+    if (core && !sp_config_module_enabled(core->cfg, SP_MODULE_RECORDING)) {
+        sp_core_detail(core, "the recording module is switched off");
+        return SP_ERR_DISABLED;
+    }
+    SP_ENTRY(core);
+    if (!path_out)
+        return SP_ERR_INVALID_ARG;
+
+    char path[sizeof core->rec_path_view];
+    sp_status st = record_start_named(core, call, path, sizeof path);
     if (st != SP_OK)
         return st;
-    *path_out = rec->rec_path;
+    memcpy(core->rec_path_view, path, sizeof path);
+    *path_out = core->rec_path_view;
     return SP_OK;
 }
 
@@ -483,10 +575,15 @@ sp_status sp_call_record_stop(sp_core *core, sp_call_id call) {
     }
 
     SP_ENTRY(core);
+    rec_writer w = { PJSUA_INVALID_ID, NULL, NULL, PJSUA_INVALID_ID };
+    pthread_mutex_lock(&g_rec_lock);
     sp_call_rec *rec = rec_of(core, call, NULL);
+    if (rec)
+        w = writer_take(rec);
+    pthread_mutex_unlock(&g_rec_lock);
     if (!rec)
         return not_found(core, call);
-    recorder_stop(rec);
+    writer_destroy(&w);
     return SP_OK;
 }
 
@@ -495,13 +592,15 @@ sp_status sp_call_get_info(sp_core *core, sp_call_id call, sp_call_info *out) {
     if (!out)
         return SP_ERR_INVALID_ARG;
     int native = PJSUA_INVALID_ID;
-    sp_call_rec *rec = rec_of(core, call, &native);
-    if (!rec)
+    if (!native_of(core, call, &native))
         return not_found(core, call);
 
     pjsua_call_info ci;
     if (pjsua_call_get_info(native, &ci) != PJ_SUCCESS)
         return SP_ERR_NOT_FOUND;
+    char codec[64] = "";
+    if (ci.state == PJSIP_INV_STATE_CONFIRMED)
+        stream_codec(native, codec, sizeof codec);
 
     memset(out, 0, sizeof *out);
     switch (ci.state) {
@@ -513,23 +612,36 @@ sp_status sp_call_get_info(sp_core *core, sp_call_id call, sp_call_info *out) {
     case PJSIP_INV_STATE_CONFIRMED:    out->state = SP_CALL_CONFIRMED; break;
     case PJSIP_INV_STATE_DISCONNECTED: out->state = SP_CALL_DISCONNECTED; break;
     }
+    out->last_code = ci.last_status;
+    out->duration_s = ci.connect_duration.sec;
+
+    sp_call_info_view *v = &core->call_info_view;
+    pthread_mutex_lock(&g_rec_lock);
+    sp_call_rec *rec = rec_of(core, call, NULL);
+    if (!rec) {
+        pthread_mutex_unlock(&g_rec_lock);
+        return not_found(core, call);
+    }
     out->acc = rec->acc;
     out->on_hold = rec->on_hold;
     out->recording = rec->recorder != PJSUA_INVALID_ID ||
                      rec->rec_port != NULL;
     out->inbound = rec->inbound;
-    out->last_code = ci.last_status;
-    out->duration_s = ci.connect_duration.sec;
+    /* Refresh before copying out, so a caller that asks before any
+       state event still gets the current identity. */
+    refresh_party(rec, &ci, codec);
+    memcpy(v->remote_uri, rec->remote_uri, sizeof v->remote_uri);
+    memcpy(v->local_uri, rec->local_uri, sizeof v->local_uri);
+    memcpy(v->codec, rec->codec, sizeof v->codec);
+    v->remote = rec->remote;
+    pthread_mutex_unlock(&g_rec_lock);
 
-    /* Refresh before handing out pointers, so a caller that asks
-       before any state event still gets the current identity. */
-    refresh_party(rec, native, &ci);
-    out->remote_uri = rec->remote_uri;
-    out->remote_display = rec->remote.display;
-    out->remote_user = rec->remote.user;
-    out->remote_label = sp_sipuri_label(&rec->remote);
-    out->local_uri = rec->local_uri;
-    out->codec = rec->codec[0] ? rec->codec : NULL;
+    out->remote_uri = v->remote_uri;
+    out->remote_display = v->remote.display;
+    out->remote_user = v->remote.user;
+    out->remote_label = sp_sipuri_label(&v->remote);
+    out->local_uri = v->local_uri;
+    out->codec = v->codec[0] ? v->codec : NULL;
     return SP_OK;
 }
 
@@ -608,28 +720,44 @@ static void quality_from(sp_call_quality *q, const pjmedia_rtcp_stat *r,
                      &q->r_factor, &q->mos);
 }
 
-void sp_call_sample_quality(sp_core *core, sp_call_rec *rec) {
-    (void)core;
-    if (!rec || rec->native == PJSUA_INVALID_ID)
-        return;
-    /* A final sample is the last word; a later tick must not overwrite
-       it with an empty read from a stream that no longer exists. */
-    if (rec->quality.final)
-        return;
+/* Reads the call's live stream into fresh, then leaves the record's
+   own sample -- refreshed with it when there was one -- in out. False
+   when the call is gone. Silent when there is no stream to read: a call
+   that has no media yet is not an error.
+ *
+ * A final sample is the last word on its stream, and is kept until the
+ * media comes up again (on_call_media_state): a tick in between must
+ * not replace it with a read of a stream that is going away. */
+static bool sample_quality(sp_core *core, sp_call_id call,
+                           sp_call_quality *out) {
+    int native = PJSUA_INVALID_ID;
+    if (!native_of(core, call, &native))
+        return false;
 
+    sp_call_quality fresh;
+    bool have = false;
     pjsua_call_info ci;
-    if (pjsua_call_get_info(rec->native, &ci) != PJ_SUCCESS)
-        return;
-    int idx = audio_med_idx(&ci);
-    if (idx < 0)
-        return;
+    if (native != PJSUA_INVALID_ID
+        && pjsua_call_get_info(native, &ci) == PJ_SUCCESS) {
+        int idx = audio_med_idx(&ci);
+        pjsua_stream_stat ss;
+        if (idx >= 0
+            && pjsua_call_get_stream_stat(native, (unsigned)idx, &ss)
+                   == PJ_SUCCESS) {
+            quality_from(&fresh, &ss.rtcp, &ss.jbuf, false);
+            have = true;
+        }
+    }
 
-    pjsua_stream_stat ss;
-    if (pjsua_call_get_stream_stat(rec->native, (unsigned)idx, &ss)
-            != PJ_SUCCESS)
-        return;
-
-    quality_from(&rec->quality, &ss.rtcp, &ss.jbuf, false);
+    pthread_mutex_lock(&g_rec_lock);
+    sp_call_rec *rec = rec_of(core, call, NULL);
+    if (rec) {
+        if (have && !rec->quality.final)
+            rec->quality = fresh;
+        *out = rec->quality;
+    }
+    pthread_mutex_unlock(&g_rec_lock);
+    return rec != NULL;
 }
 
 /* What the bridge is carrying right now, per direction.
@@ -647,19 +775,16 @@ sp_status sp_call_get_signal(sp_core *core, sp_call_id call,
         return SP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
 
-    pthread_mutex_lock(&core->lock);
-    sp_call_rec *rec = rec_of(core, call, NULL);
-    if (!rec) {
-        pthread_mutex_unlock(&core->lock);
+    int native = PJSUA_INVALID_ID;
+    if (!native_of(core, call, &native))
         return not_found(core, call);
-    }
 
     pjsua_call_info ci;
-    if (pjsua_call_get_info(rec->native, &ci) != PJ_SUCCESS
+    if (native == PJSUA_INVALID_ID
+        || pjsua_call_get_info(native, &ci) != PJ_SUCCESS
         || ci.conf_slot == PJSUA_INVALID_ID) {
         /* Between answering and media coming up there is no slot.
            A normal moment, not a fault: valid says so. */
-        pthread_mutex_unlock(&core->lock);
         return SP_OK;
     }
 
@@ -669,7 +794,6 @@ sp_status sp_call_get_signal(sp_core *core, sp_call_id call,
         out->rx = rx;
         out->valid = true;
     }
-    pthread_mutex_unlock(&core->lock);
     return SP_OK;
 }
 
@@ -686,15 +810,8 @@ sp_status sp_call_get_quality(sp_core *core, sp_call_id call,
         return SP_ERR_INVALID_ARG;
     memset(out, 0, sizeof *out);
 
-    pthread_mutex_lock(&core->lock);
-    sp_call_rec *rec = rec_of(core, call, NULL);
-    if (!rec) {
-        pthread_mutex_unlock(&core->lock);
+    if (!sample_quality(core, call, out))
         return not_found(core, call);
-    }
-    sp_call_sample_quality(core, rec);
-    *out = rec->quality;
-    pthread_mutex_unlock(&core->lock);
     return SP_OK;
 }
 
@@ -734,27 +851,25 @@ static void metrics_tick(pj_timer_heap_t *th, pj_timer_entry *e) {
     }
     interval = core->cfg->metrics_interval_ms;
 
+    pthread_mutex_unlock(&core->lock);
+
     uint64_t ids[PJSUA_MAX_CALLS];
     size_t n = 0;
     sp_ht_snapshot(core->calls, ids, PJSUA_MAX_CALLS, &n);
     if (n > PJSUA_MAX_CALLS)
         n = PJSUA_MAX_CALLS;
     for (size_t i = 0; i < n; i++) {
-        sp_call_rec *rec = rec_of(core, ids[i], NULL);
-        if (!rec)
-            continue;
-        sp_call_sample_quality(core, rec);
-        if (!rec->quality.valid)
+        sp_call_quality q;
+        if (!sample_quality(core, ids[i], &q) || !q.valid)
             continue;
         snap[n_snap].call      = ids[i];
-        snap[n_snap].mos       = rec->quality.mos;
-        snap[n_snap].loss      = rec->quality.rx_loss_pct;
-        snap[n_snap].jitter_us = rec->quality.rx_jitter.avg_us;
-        snap[n_snap].rtt_us    = rec->quality.rtt.avg_us;
-        snap[n_snap].final     = rec->quality.final;
+        snap[n_snap].mos       = q.mos;
+        snap[n_snap].loss      = q.rx_loss_pct;
+        snap[n_snap].jitter_us = q.rx_jitter.avg_us;
+        snap[n_snap].rtt_us    = q.rtt.avg_us;
+        snap[n_snap].final     = q.final;
         n_snap++;
     }
-    pthread_mutex_unlock(&core->lock);
 
     for (size_t i = 0; i < n_snap; i++) {
         sp_event ev;
@@ -847,25 +962,6 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id,
     rec->recorder = PJSUA_INVALID_ID;
     rec->rec_slot = PJSUA_INVALID_ID;
 
-    uint64_t handle = sp_ht_add(core->calls, call_id, rec);
-    if (handle == 0) {
-        free(rec);
-        pjsua_call_hangup(call_id, 500, NULL, NULL);
-        return;
-    }
-    rec->handle = handle;
-    sp_transcriber_call_started(core->transcriber);
-    pjsua_call_set_user_data(call_id, rec);
-
-    /* Ring. Before the event is posted, so the phone is audible even
-       if a frontend is slow to draw its call display. */
-    sp_sound_start(core, SP_SOUND_RINGTONE);
-
-    /* A call that is merely ringing already means the operator is
-       about to answer it; any leftover playback from before this
-       call arrived must be silent by the time they do. */
-    sp_playback_stop(core);
-
     pjsua_call_info ci;
     char from[256] = {0}, local[256] = {0}, cid[256] = {0};
     if (pjsua_call_get_info(call_id, &ci) == PJ_SUCCESS) {
@@ -879,23 +975,49 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id,
     snprintf(rec->remote_uri, sizeof rec->remote_uri, "%s", from);
     snprintf(rec->local_uri, sizeof rec->local_uri, "%s", local);
     sp_sipuri_parse(rec->remote_uri, &rec->remote);
-
     rec->history_id = sp_history_begin(core->history, true,
                                        sp_account_id_of(core, rec->acc),
                                        from, local, cid);
 
+    /* Complete before it is in the table, where an API thread can
+       find it. */
+    pthread_mutex_lock(&g_rec_lock);
+    uint64_t handle = sp_ht_add(core->calls, call_id, rec);
+    rec->handle = handle;
+    pthread_mutex_unlock(&g_rec_lock);
+    if (handle == 0) {
+        if (rec->history_id > 0)
+            sp_history_ended(core->history, rec->history_id, 500, 0);
+        free(rec);
+        pjsua_call_hangup(call_id, 500, NULL, NULL);
+        return;
+    }
+    sp_transcriber_call_started(core->transcriber);
+    pjsua_call_set_user_data(call_id, rec);
+
+    /* Ring. Before the event is posted, so the phone is audible even
+       if a frontend is slow to draw its call display. */
+    sp_sound_start(core, SP_SOUND_RINGTONE);
+
+    /* A call that is merely ringing already means the operator is
+       about to answer it; any leftover playback from before this
+       call arrived must be silent by the time they do. */
+    sp_playback_stop(core);
+
     sp_event ev = {0};
     ev.type = SP_EV_INCOMING_CALL;
     ev.u.incoming.call = handle;
-    ev.u.incoming.acc = rec->acc;
+    ev.u.incoming.acc = sp_ht_by_native(core->accounts, acc_id);
     ev.u.incoming.from_uri = from;
     sp_core_post(core, &ev);
 }
 
 /* Refreshes the cached identity and codec. Called on every state
-   change, because remote_info is not final until the dialog is. */
-static void refresh_party(sp_call_rec *rec, pjsua_call_id native,
-                          const pjsua_call_info *ci) {
+   change, because remote_info is not final until the dialog is. The
+   codec is the caller's to fetch (stream_codec), being a pjsua call.
+   Caller holds g_rec_lock. */
+static void refresh_party(sp_call_rec *rec, const pjsua_call_info *ci,
+                          const char *codec) {
     if (!rec || !ci)
         return;
     if (ci->remote_info.slen > 0)
@@ -906,15 +1028,8 @@ static void refresh_party(sp_call_rec *rec, pjsua_call_id native,
                  (int)ci->local_info.slen, ci->local_info.ptr);
     sp_sipuri_parse(rec->remote_uri, &rec->remote);
 
-    if (ci->state == PJSIP_INV_STATE_CONFIRMED && !rec->codec[0]) {
-        pjsua_stream_info si;
-        if (pjsua_call_get_stream_info(native, 0, &si) == PJ_SUCCESS &&
-            si.type == PJMEDIA_TYPE_AUDIO &&
-            si.info.aud.fmt.encoding_name.slen > 0)
-            snprintf(rec->codec, sizeof rec->codec, "%.*s",
-                     (int)si.info.aud.fmt.encoding_name.slen,
-                     si.info.aud.fmt.encoding_name.ptr);
-    }
+    if (codec && *codec && !rec->codec[0])
+        snprintf(rec->codec, sizeof rec->codec, "%s", codec);
 }
 
 /* user_data is authoritative: it is set before the native id is
@@ -969,10 +1084,13 @@ static void maybe_auto_record(sp_core *core, sp_call_rec *rec,
         || ci->conf_slot == PJSUA_INVALID_ID)
         return;
     rec->auto_record_tried = true;
-    if (rec->recorder != PJSUA_INVALID_ID || rec->rec_port)
+    pthread_mutex_lock(&g_rec_lock);
+    const bool busy = rec->recorder != PJSUA_INVALID_ID || rec->rec_port;
+    pthread_mutex_unlock(&g_rec_lock);
+    if (busy)
         return;
-    const char *path = NULL;
-    if (sp_call_record_start_auto(core, handle, &path) == SP_OK)
+    char path[sizeof core->rec_path_view];
+    if (record_start_named(core, handle, path, sizeof path) == SP_OK)
         sp_actionlog_add(core, 1, "recording the call automatically");
     else
         sp_actionlog_add(core, 2, "automatic recording could not start");
@@ -983,7 +1101,7 @@ static void maybe_auto_record(sp_core *core, sp_call_rec *rec,
  * rec->cap is set and used from pjsip's thread and taken away from
  * whichever thread ends the call or switches the module off -- the UI
  * thread, when hangup or the module switch comes from there -- and the
- * record is freed once it has left the table. g_cap_lock covers only
+ * record is freed once it has left the table. g_rec_lock covers only
  * the handoff: no pjsua call is ever made while holding it, because
  * pjsua takes PJSUA_LOCK inside its own calls and may hold it while
  * calling on_call_state, which takes this lock. A thread that takes a
@@ -997,9 +1115,7 @@ struct sp_cap_ref {
     char         label[128];
 };
 
-static pthread_mutex_t g_cap_lock = PTHREAD_MUTEX_INITIALIZER;
-
-/* Under g_cap_lock: takes the capture off the record. Returns it if the
+/* Under g_rec_lock: takes the capture off the record. Returns it if the
    caller is to stop it now, NULL if a user will. */
 static struct sp_cap_ref *detach_locked(sp_call_rec *rec) {
     struct sp_cap_ref *r = rec->cap;
@@ -1034,18 +1150,18 @@ static void maybe_capture(sp_core *core, sp_call_rec *rec,
     const bool live = ci->media_status == PJSUA_CALL_MEDIA_ACTIVE
                       && ci->conf_slot != PJSUA_INVALID_ID;
 
-    pthread_mutex_lock(&g_cap_lock);
+    pthread_mutex_lock(&g_rec_lock);
     struct sp_cap_ref *r = rec->cap;
     if (r)
         r->users++;
-    pthread_mutex_unlock(&g_cap_lock);
+    pthread_mutex_unlock(&g_rec_lock);
     if (r) {
         if (live)
             sp_transcap_follow(r->cap, ci->conf_slot);
         sp_transcap_hear_mic(r->cap, live);
-        pthread_mutex_lock(&g_cap_lock);
+        pthread_mutex_lock(&g_rec_lock);
         const bool stop = --r->users == 0 && r->stop_pending;
-        pthread_mutex_unlock(&g_cap_lock);
+        pthread_mutex_unlock(&g_rec_lock);
         if (stop)
             stop_ref(r);
         return;
@@ -1075,9 +1191,9 @@ static void maybe_capture(sp_core *core, sp_call_rec *rec,
         sp_actionlog_add(core, 2, "the transcript capture could not start");
         return;
     }
-    pthread_mutex_lock(&g_cap_lock);
+    pthread_mutex_lock(&g_rec_lock);
     rec->cap = made;
-    pthread_mutex_unlock(&g_cap_lock);
+    pthread_mutex_unlock(&g_rec_lock);
     sp_history_transcript_state(core->history, rec->history_id,
                                 SP_TRANSCRIPT_PENDING);
 }
@@ -1090,7 +1206,7 @@ void sp_call_stop_captures(sp_core *core) {
 
     /* A record found here cannot be freed before the lock is let go:
        on_call_state retires it under the same lock first. */
-    pthread_mutex_lock(&g_cap_lock);
+    pthread_mutex_lock(&g_rec_lock);
     sp_ht_snapshot(core->calls, ids, PJSUA_MAX_CALLS, &n);
     if (n > PJSUA_MAX_CALLS)
         n = PJSUA_MAX_CALLS;
@@ -1102,7 +1218,7 @@ void sp_call_stop_captures(sp_core *core) {
         if (r)
             now[n_now++] = r;
     }
-    pthread_mutex_unlock(&g_cap_lock);
+    pthread_mutex_unlock(&g_rec_lock);
 
     for (size_t i = 0; i < n_now; i++)
         stop_ref(now[i]);
@@ -1110,14 +1226,14 @@ void sp_call_stop_captures(sp_core *core) {
 
 pjsua_conf_port_id sp_call_capture_mic_slot(sp_core *core, sp_call_id call) {
     pjsua_conf_port_id slot = PJSUA_INVALID_ID;
-    pthread_mutex_lock(&g_cap_lock);
+    pthread_mutex_lock(&g_rec_lock);
     void *data = NULL;
     if (sp_ht_lookup(core->calls, call, NULL, &data) == 0 && data) {
         const sp_call_rec *rec = data;
         if (rec->cap)
             slot = sp_transcap_mic_slot(rec->cap->cap);
     }
-    pthread_mutex_unlock(&g_cap_lock);
+    pthread_mutex_unlock(&g_rec_lock);
     return slot;
 }
 
@@ -1135,9 +1251,20 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e) {
     if (pjsua_call_get_info(call_id, &ci) != PJ_SUCCESS)
         return;
 
+    char codec[64] = "";
+    if (ci.state == PJSIP_INV_STATE_CONFIRMED)
+        stream_codec(call_id, codec, sizeof codec);
+
+    /* This thread is the one that frees the record, below, so it may
+       keep the pointer; the lock is for the API threads reading the
+       fields meanwhile. */
+    sp_call_quality quality = {0};
     if (rec) {
+        pthread_mutex_lock(&g_rec_lock);
         rec->last_code = ci.last_status;
-        refresh_party(rec, call_id, &ci);
+        refresh_party(rec, &ci, codec);
+        quality = rec->quality;
+        pthread_mutex_unlock(&g_rec_lock);
     }
 
     if (rec && rec->history_id > 0) {
@@ -1149,24 +1276,15 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e) {
                      ci.call_id.ptr);
             sp_history_set_call_id(core->history, rec->history_id, cid);
         }
-        if (ci.state == PJSIP_INV_STATE_CONFIRMED) {
-            char codec[64] = {0};
-            pjsua_stream_info si;
-            if (pjsua_call_get_stream_info(call_id, 0, &si) == PJ_SUCCESS &&
-                si.type == PJMEDIA_TYPE_AUDIO)
-                snprintf(codec, sizeof codec, "%.*s",
-                         (int)si.info.aud.fmt.encoding_name.slen,
-                         si.info.aud.fmt.encoding_name.ptr);
+        if (ci.state == PJSIP_INV_STATE_CONFIRMED)
             sp_history_answered(core->history, rec->history_id,
                                 codec[0] ? codec : NULL);
-        }
         if (ci.state == PJSIP_INV_STATE_DISCONNECTED) {
             /* The snapshot was taken in on_stream_destroyed, which has
                already run by the time DISCONNECTED arrives; this only
                persists what is cached. Sampling here instead would
                read a stream that no longer exists. */
-            sp_history_quality(core->history, rec->history_id,
-                               &rec->quality);
+            sp_history_quality(core->history, rec->history_id, &quality);
             sp_history_ended(core->history, rec->history_id,
                              (int)ci.last_status,
                              (uint32_t)ci.connect_duration.sec);
@@ -1219,15 +1337,17 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e) {
            call that just ended. Destroy the recorder here or a call
            that ends mid-recording leaks the writer -- and, for Opus,
            leaves the file with no end-of-stream page. */
-        if (rec)
-            recorder_stop(rec);
-        /* The capture is taken and the record retired under g_cap_lock,
-           so a module switch on another thread finds either both or
-           neither; the stop and the free come after. */
-        pthread_mutex_lock(&g_cap_lock);
+        /* The recorder and the capture are taken and the record retired
+           under g_rec_lock, so another thread finds either all of it or
+           none; the stops and the free come after. */
+        rec_writer w = { PJSUA_INVALID_ID, NULL, NULL, PJSUA_INVALID_ID };
+        pthread_mutex_lock(&g_rec_lock);
         struct sp_cap_ref *cap = rec ? detach_locked(rec) : NULL;
+        if (rec)
+            w = writer_take(rec);
         sp_ht_retire(core->calls, handle);
-        pthread_mutex_unlock(&g_cap_lock);
+        pthread_mutex_unlock(&g_rec_lock);
+        writer_destroy(&w);
         stop_ref(cap);
         free(rec);
     }
@@ -1254,6 +1374,21 @@ static void on_call_media_state(pjsua_call_id call_id) {
     if (active && ci.conf_slot != PJSUA_INVALID_ID) {
         pjsua_conf_connect(ci.conf_slot, 0);
         pjsua_conf_connect(0, ci.conf_slot);
+    }
+    if (rec) {
+        pthread_mutex_lock(&g_rec_lock);
+        /* What the far end agreed to, which a refused re-INVITE leaves
+           as it was whatever sp_call_set_hold assumed. */
+        if (active)
+            rec->on_hold = false;
+        else if (ci.media_status == PJSUA_CALL_MEDIA_LOCAL_HOLD)
+            rec->on_hold = true;
+        /* A stream that came back after a hold or a re-INVITE is
+           sampled again; the final sample of the one before it has
+           been reported. */
+        if (active)
+            rec->quality.final = false;
+        pthread_mutex_unlock(&g_rec_lock);
     }
     maybe_auto_record(core, rec, handle, &ci);
     maybe_capture(core, rec, &ci);
@@ -1321,11 +1456,17 @@ static void on_stream_destroyed(pjsua_call_id call_id, pjmedia_stream *strm,
     pjmedia_jb_state jb;
     bool have_jb = pjmedia_stream_get_stat_jbuf(strm, &jb) == PJ_SUCCESS;
 
-    pthread_mutex_lock(&core->lock);
+    sp_call_quality last;
+    quality_from(&last, &rtcp, have_jb ? &jb : NULL, true);
+
+    /* g_rec_lock, a leaf, and not core->lock: pjsua holds PJSUA_LOCK
+       across this callback, and core->lock is held elsewhere across
+       calls into pjsua. */
+    pthread_mutex_lock(&g_rec_lock);
     sp_call_rec *rec = rec_from_native(core, call_id, NULL);
     if (rec)
-        quality_from(&rec->quality, &rtcp, have_jb ? &jb : NULL, true);
-    pthread_mutex_unlock(&core->lock);
+        rec->quality = last;
+    pthread_mutex_unlock(&g_rec_lock);
 }
 
 void sp_call_install_callbacks(pjsua_callback *cb) {
@@ -1354,6 +1495,11 @@ sp_status sp_call_uri_complete(sp_core *core, sp_account_id acc,
         n--;
     if (n == 0)
         return SP_ERR_INVALID_ARG;
+    /* A transfer target goes into Refer-To as it is, where a line
+       break would start a header of its own. */
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)input[i] < 0x20 || input[i] == 0x7f)
+            return SP_ERR_INVALID_ARG;
 
     /* A truncated URI dials somebody else, so every path below
        refuses rather than writes a prefix. */
@@ -1372,10 +1518,28 @@ sp_status sp_call_uri_complete(sp_core *core, sp_account_id acc,
     }
 
     int wrote;
-    if (fmt)
+    if (fmt) {
         wrote = snprintf(out, outlen, fmt, (int)n, input);
-    else
-        wrote = snprintf(out, outlen, "sip:%.*s@%s", (int)n, input, domain);
+    } else {
+        /* What was typed is the user part, and "#" -- as in "*72#" --
+           is not allowed bare in one: pjsip refuses the URI. */
+        char user[384];
+        size_t u = 0;
+        for (size_t i = 0; i < n; i++) {
+            const unsigned char c = (unsigned char)input[i];
+            const bool plain = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+                               || (c >= 'a' && c <= 'z')
+                               || strchr("-_.!~*'()&=+$,;?/", c);
+            if (u + 4 > sizeof user)
+                return SP_ERR_INVALID_ARG;
+            if (plain)
+                user[u++] = (char)c;
+            else
+                u += (size_t)snprintf(user + u, 4, "%%%02X", c);
+        }
+        user[u] = '\0';
+        wrote = snprintf(out, outlen, "sip:%s@%s", user, domain);
+    }
     if (wrote < 0 || (size_t)wrote >= outlen) {
         *out = '\0';
         return SP_ERR_INVALID_ARG;

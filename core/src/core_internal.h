@@ -64,8 +64,6 @@ typedef struct {
     pjmedia_port      *rec_port;
     pj_pool_t         *rec_pool;
     pjsua_conf_port_id rec_slot;
-    char              rec_path[512]; /* what record_start_auto chose, for
-                                        the caller */
     /* Whether auto-record has had its one go at this call. Once, so a
        recording the operator stops stays stopped through a hold and a
        resume, which bring the media up again. */
@@ -83,10 +81,18 @@ typedef struct {
     sp_party          remote;
     /* The last quality sample taken, so a query never has to reach
        into a stream that may already be gone, and so the figures
-       written to history survive the stream's destruction. Guarded by
-       core->lock. */
+       written to history survive the stream's destruction. */
     sp_call_quality   quality;
 } sp_call_rec;
+
+/* What sp_call_get_info's strings point into: a copy, so they outlive
+   the call record, which a pjsip thread frees at DISCONNECTED. */
+typedef struct {
+    char     remote_uri[256];
+    char     local_uri[256];
+    char     codec[64];
+    sp_party remote;
+} sp_call_info_view;
 
 struct sp_core {
     sp_config       *cfg;
@@ -128,6 +134,8 @@ struct sp_core {
     sp_playback_state playback;
     sp_handle_table *accounts;
     sp_handle_table *calls;
+    sp_call_info_view call_info_view;
+    char             rec_path_view[512];
     sp_event_queue  *evq;
     sp_event_cb      cb;
     void            *cb_user;
@@ -214,10 +222,6 @@ sp_status sp_metrics_start(sp_core *core);
    before pjsua_destroy, or a queued fire lands in a freed core. */
 void sp_metrics_stop(sp_core *core);
 
-/* Refreshes rec->quality from pjmedia. Silent on failure: a call that
-   has no media yet is not an error. Caller holds core->lock. */
-void sp_call_sample_quality(sp_core *core, sp_call_rec *rec);
-
 /* Applies the configured audio devices without writing the config
    back. Called once from sp_core_start. */
 sp_status sp_media_apply_config(sp_core *core);
@@ -259,7 +263,7 @@ void sp_call_stop_captures(sp_core *core);
 pjsua_conf_port_id sp_call_capture_mic_slot(sp_core *core, sp_call_id call);
 
 sp_status sp_hdr_module_register(sp_core *core);
-void      sp_hdr_module_unregister(void);
+void      sp_hdr_module_detach(void);
 
 #define SP_ENTRY(c) do {                        \
         if (!(c)) return SP_ERR_INVALID_ARG;    \

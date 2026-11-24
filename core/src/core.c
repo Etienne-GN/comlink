@@ -645,6 +645,10 @@ sp_status sp_core_start(sp_core *core) {
 
     log.level = (unsigned)core->cfg->log_level;
     log.console_level = (unsigned)core->cfg->log_level;
+    /* pjsua's own dump of every SIP message, credentials and all,
+       which the redaction never sees. The trace is where messages
+       are kept. */
+    log.msg_logging = PJ_FALSE;
     /* Also into the event stream, so the phone can show its own
        reason for refusing a call rather than keeping it in a terminal
        that does not exist on a handset. */
@@ -749,9 +753,9 @@ sp_status sp_core_start(sp_core *core) {
 
 unwind:
     sp_metrics_stop(core);
-    sp_hdr_module_unregister();
     sp_evq_stop(core->evq);
     pjsua_destroy();
+    sp_hdr_module_detach();
     core->pj_ready = false;
     pthread_mutex_lock(&g_core_lock); g_core = NULL;
     pthread_mutex_unlock(&g_core_lock);
@@ -777,9 +781,9 @@ sp_status sp_core_stop(sp_core *core) {
        player alive across a core stop is a use-after-free waiting for
        the next sp_playback_start. */
     sp_playback_stop(core);
-    sp_hdr_module_unregister();
     sp_evq_stop(core->evq);
     pjsua_destroy();
+    sp_hdr_module_detach();
     core->pj_ready = false;
 
     pthread_mutex_lock(&g_core_lock);

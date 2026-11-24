@@ -1,3 +1,10 @@
+comlink (1.2.0-1) unstable; urgency=medium
+
+  * Back up and restore settings, accounts, passwords and contacts
+    from a Backup page in Settings, optionally sealed with a passphrase.
+
+ -- Étienne Gagné <etienne.gagnenadeau@gmail.com>  Tue, 24 Nov 2026 14:10:00 -0500
+
 comlink (1.1.0-1) unstable; urgency=medium
 
   * Recall earlier calls in the dial field with Up and Down.

@@ -36,9 +36,26 @@ qt_add_qml_module(comlink-quick
         SettingsRecordingPage.qml SettingsSoundsPage.qml
         SettingsThemePage.qml SettingsWindowPage.qml
         SettingsPage.qml FormRow.qml SettingsTranscriptPage.qml
+        SettingsBackupPage.qml
         TranscriptView.qml
     SOURCES corebridge.h corebridge.cpp secretstore.h secretstore.cpp
+            backup.h backup.cpp
             modelfetcher.h modelfetcher.cpp)
+
+# For sealing a backup file. The same libcrypto the core already
+# brings into the process for SIP over TLS, named here because the
+# core links it privately.
+if(ANDROID)
+    # By path: under the NDK toolchain pkg-config's imported target
+    # resolves to a bare -lcrypto with no directory to find it in.
+    target_include_directories(comlink-quick PRIVATE
+        "${COMLINK_DEPS_PREFIX}/include")
+    target_link_libraries(comlink-quick PRIVATE
+        "${COMLINK_DEPS_PREFIX}/lib/libcrypto_3.so")
+else()
+    pkg_check_modules(LIBCRYPTO REQUIRED IMPORTED_TARGET libcrypto)
+    target_link_libraries(comlink-quick PRIVATE PkgConfig::LIBCRYPTO)
+endif()
 
 # Qt6::Network for QNetworkInformation: a wifi-to-LTE handoff is
 # reported by Qt on both platforms, so the transports are rebuilt
@@ -155,7 +172,8 @@ endif()
 # there is no ctest to run it from.
 if(NOT ANDROID)
     add_executable(test_bridge tests/test_bridge.cpp corebridge.cpp
-                               secretstore.cpp)
+                               secretstore.cpp backup.cpp)
+    target_link_libraries(test_bridge PRIVATE PkgConfig::LIBCRYPTO)
     # Qt6::Gui for QImage: the picture path decodes, crops and
     # encodes here, so the test has to be able to read what it
     # produced.
@@ -203,7 +221,8 @@ if(NOT ANDROID)
     # started per process and this one starts from a configuration
     # the test wrote.
     add_executable(test_migration tests/test_migration.cpp corebridge.cpp
-                                  secretstore.cpp)
+                                  secretstore.cpp backup.cpp)
+    target_link_libraries(test_migration PRIVATE PkgConfig::LIBCRYPTO)
     target_link_libraries(test_migration PRIVATE Qt6::Qml Qt6::Gui
                           Qt6::Network Qt6::DBus comlink_core)
     target_include_directories(test_migration PRIVATE

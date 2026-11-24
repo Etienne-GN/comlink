@@ -24,10 +24,11 @@ Rectangle {
     signal modulesChanged()
     signal activityLogVisibilityChanged(bool shown)
     signal windowSizeRequested()
+    signal backupRestored()
 
     readonly property var categories: ["Audio", "Codecs", "Modules",
                                        "Recording", "Sounds", "Theme",
-                                       "Window", "Transcript"]
+                                       "Window", "Transcript", "Backup"]
 
     /* Too narrow for the sidebar and a page beside it -- the handset,
        always, or a desktop window shrunk to its width. The categories
@@ -222,6 +223,11 @@ Rectangle {
                 SettingsTranscriptPage {
                     anchors.fill: pageArea
                     visible: root.page === 7
+                }
+                SettingsBackupPage {
+                    anchors.fill: pageArea
+                    visible: root.page === 8
+                    onRestoredOk: root.backupRestored()
                 }
             }
         }

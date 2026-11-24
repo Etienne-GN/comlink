@@ -3,6 +3,13 @@
 #include <cstdio>
 #include <cstring>
 #include "secretstore.h"
+#include "backup.h"
+
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QRegularExpression>
+#include <QSaveFile>
 
 #ifdef Q_OS_ANDROID
 #include <QJniObject>
@@ -208,20 +215,37 @@ CoreBridge::CoreBridge(QObject *parent) : QObject(parent) {
         }
     }
     m_cfgPath = cfg;
-    if (sp_core_create(cfg.toUtf8().constData(), &m_core) == SP_OK) {
-        sp_core_set_event_cb(m_core, spBridgeEvent, this);
-        connect(this, &CoreBridge::callChanged, this,
-                &CoreBridge::syncAudioMode);
-        reloadTheme();
-    }
+    connect(this, &CoreBridge::callChanged, this,
+            &CoreBridge::syncAudioMode);
+    openCore();
 }
 
-CoreBridge::~CoreBridge() {
+bool CoreBridge::openCore() {
+    if (sp_core_create(m_cfgPath.toUtf8().constData(), &m_core) != SP_OK) {
+        m_core = nullptr;
+        return false;
+    }
+    sp_core_set_event_cb(m_core, spBridgeEvent, this);
+    reloadTheme();
+    return true;
+}
+
+void CoreBridge::closeCore() {
     setReachable(false);
     if (m_core) {
         sp_core_stop(m_core);
         sp_core_destroy(m_core);
     }
+    m_core = nullptr;
+    m_started = false;
+    m_account = 0;
+    m_call = 0;
+    m_ringing = 0;
+    m_registered = false;
+}
+
+CoreBridge::~CoreBridge() {
+    closeCore();
 }
 
 void CoreBridge::reloadTheme() {
@@ -2428,6 +2452,286 @@ bool CoreBridge::networkChanged() {
 
 bool CoreBridge::deleteContact(qlonglong id) {
     return m_core && sp_contact_delete(m_core, (int64_t)id) == SP_OK;
+}
+
+namespace {
+const int BACKUP_FORMAT = 1;
+const qint64 MAX_BACKUP_BYTES = 256 * 1024 * 1024;
+const size_t ALL_CONTACTS = 1000000;
+
+/* content:// on Android, file:// on the desktop; QFile opens both. */
+QString pathOf(const QString &url) {
+    const QUrl u(url);
+    return u.isLocalFile() ? u.toLocalFile() : url;
+}
+
+/* Where the database is belongs to the device, not to the backup: a
+   file made on a handset names a directory no desktop has. */
+QString withDbFileOf(const QString &theirs, const QString &ours) {
+    static const QRegularExpression line(
+        QStringLiteral("^db_file:[^\\n]*\\n?"),
+        QRegularExpression::MultilineOption);
+    const QRegularExpressionMatch mine = line.match(ours);
+    QString out = theirs;
+    out.remove(line);
+    if (mine.hasMatch()) {
+        QString kept = mine.captured(0);
+        if (!kept.endsWith(QLatin1Char('\n')))
+            kept += QLatin1Char('\n');
+        out.prepend(kept);
+    }
+    return out;
+}
+
+bool writePrivate(const QString &path, const QByteArray &bytes) {
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly))
+        return false;
+    f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    return f.write(bytes) == bytes.size() && f.commit();
+}
+}  // namespace
+
+QString CoreBridge::backupTo(const QString &url, const QString &passphrase) {
+    if (!m_core)
+        return tr("The phone is not running.");
+    QFile cf(m_cfgPath);
+    if (!cf.open(QIODevice::ReadOnly))
+        return tr("The configuration could not be read: %1")
+            .arg(cf.errorString());
+
+    QJsonObject root;
+    root["comlink_backup"] = BACKUP_FORMAT;
+    root["created"] = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    root["config"] = QString::fromUtf8(cf.readAll());
+
+    /* A backup that quietly left a password out is found out on the
+       day it is needed, so one that cannot be read stops the backup. */
+    QJsonObject passwords;
+    for (const QVariant &v : accounts()) {
+        const QVariantMap row = v.toMap();
+        const QVariantMap f = accountCfg(row["id"].toLongLong());
+        if (!f["passwordKnown"].toBool())
+            return tr("The password of account \"%1\" could not be read "
+                      "from %2. Unlock it and try again.")
+                .arg(row["name"].toString(), SecretStore::describe());
+        if (!f["password"].toString().isEmpty())
+            passwords[row["name"].toString()] = f["password"].toString();
+    }
+    root["passwords"] = passwords;
+
+    const sp_contact *rows = nullptr;
+    size_t n = 0;
+    if (sp_contacts_read(m_core, nullptr, ALL_CONTACTS, &rows, &n) != SP_OK)
+        return tr("The contacts could not be read.");
+    QList<qint64> ids;
+    for (size_t i = 0; i < n; i++)
+        ids << rows[i].id;
+    QJsonArray contacts;
+    for (qint64 id : ids) {
+        const sp_contact *c = nullptr;
+        if (sp_contact_read_one(m_core, id, &c) != SP_OK || !c)
+            return tr("A contact could not be read.");
+        QJsonObject o;
+        o["name"] = str(c->name);
+        o["company"] = str(c->company);
+        o["note"] = str(c->note);
+        o["favourite"] = c->favourite;
+        QJsonArray numbers;
+        for (size_t k = 0; k < c->n_numbers; k++) {
+            QJsonObject num;
+            num["label"] = str(c->numbers[k].label);
+            num["uri"] = str(c->numbers[k].uri);
+            numbers << num;
+        }
+        o["numbers"] = numbers;
+        if (c->picture && c->picture_len > 0)
+            o["picture"] = QString::fromLatin1(
+                QByteArray((const char *)c->picture, (qsizetype)c->picture_len)
+                    .toBase64());
+        contacts << o;
+    }
+    root["contacts"] = contacts;
+
+    QByteArray bytes = QJsonDocument(root).toJson(QJsonDocument::Indented);
+    if (!passphrase.isEmpty()) {
+        QString why;
+        bytes = Backup::seal(bytes, passphrase, &why);
+        if (bytes.isEmpty())
+            return why;
+    }
+
+    /* Straight into the destination: a content:// document has no
+       directory to put a temporary beside and rename over. */
+    QFile out(pathOf(url));
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return tr("The backup could not be written: %1")
+            .arg(out.errorString());
+    out.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+    if (out.write(bytes) != bytes.size() || !out.flush())
+        return tr("The backup could not be written: %1")
+            .arg(out.errorString());
+    out.close();
+    note(tr("backup written: %1 accounts with a password, %2 contacts")
+             .arg(passwords.size()).arg(contacts.size()));
+    return QString();
+}
+
+bool CoreBridge::backupIsSealed(const QString &url) const {
+    QFile in(pathOf(url));
+    return in.open(QIODevice::ReadOnly) && Backup::sealed(in.read(64));
+}
+
+QString CoreBridge::restoreFrom(const QString &url,
+                                const QString &passphrase) {
+    if (!m_core)
+        return tr("The phone is not running.");
+    if (inCall())
+        return tr("Not during a call.");
+
+    QFile in(pathOf(url));
+    if (!in.open(QIODevice::ReadOnly))
+        return tr("The backup could not be opened: %1").arg(in.errorString());
+    if (in.size() > MAX_BACKUP_BYTES)
+        return tr("That file is too large to be a Comlink backup.");
+    QByteArray bytes = in.readAll();
+    in.close();
+    if (Backup::sealed(bytes)) {
+        QString why;
+        bytes = Backup::unseal(bytes, passphrase, &why);
+        if (bytes.isEmpty())
+            return why;
+    }
+    const QJsonObject root = QJsonDocument::fromJson(bytes).object();
+    if (root["comlink_backup"].toInt() != BACKUP_FORMAT
+        || !root["config"].isString())
+        return tr("That is not a Comlink backup this version can read.");
+
+    QFile cf(m_cfgPath);
+    if (!cf.open(QIODevice::ReadOnly))
+        return tr("The configuration could not be read: %1")
+            .arg(cf.errorString());
+    const QByteArray before = cf.readAll();
+    cf.close();
+    const QByteArray after =
+        withDbFileOf(root["config"].toString(), QString::fromUtf8(before))
+            .toUtf8();
+
+    QStringList oldNames;
+    for (const QVariant &v : accounts())
+        oldNames << v.toMap()["name"].toString();
+
+    closeCore();
+    if (!writePrivate(m_cfgPath, after) || !openCore()) {
+        closeCore();
+        const bool back = writePrivate(m_cfgPath, before) && openCore()
+                          && start();
+        emit restored();
+        return back ? tr("The configuration in that backup was refused. "
+                         "Nothing was changed.")
+                    : tr("The configuration in that backup was refused, "
+                         "and the previous one could not be put back.");
+    }
+    if (!start()) {
+        emit restored();
+        return tr("The backup was restored, but the phone did not start "
+                  "on it.");
+    }
+
+    /* Through the account form, which already knows where a password
+       goes on this device: the store when there is one, the
+       configuration when there is not. */
+    if (SecretStore::available())
+        for (const QString &name : oldNames)
+            SecretStore::erase(secretKey(name));
+    const QJsonObject passwords = root["passwords"].toObject();
+    QStringList problems;
+    for (const QVariant &v : accounts()) {
+        const QVariantMap row = v.toMap();
+        const QString pw = passwords[row["name"].toString()].toString();
+        if (pw.isEmpty())
+            continue;
+        QVariantMap f = accountCfg(row["id"].toLongLong());
+        f["password"] = pw;
+        f["passwordKnown"] = true;
+        if (saveAccount(row["id"].toLongLong(), f) == 0
+            || !m_lastError.isEmpty())
+            problems << tr("account \"%1\": %2")
+                            .arg(row["name"].toString(), m_lastError);
+    }
+
+    const sp_contact *rows = nullptr;
+    size_t n = 0;
+    QList<qint64> ids;
+    if (sp_contacts_read(m_core, nullptr, ALL_CONTACTS, &rows, &n) == SP_OK)
+        for (size_t i = 0; i < n; i++)
+            ids << rows[i].id;
+    for (qint64 id : ids)
+        sp_contact_delete(m_core, id);
+    const QJsonArray contacts = root["contacts"].toArray();
+    int lost = 0, badPictures = 0;
+    for (const QJsonValue &cv : contacts) {
+        const QJsonObject o = cv.toObject();
+        const QByteArray name = o["name"].toString().toUtf8();
+        const QByteArray company = o["company"].toString().toUtf8();
+        const QByteArray noteText = o["note"].toString().toUtf8();
+        /* A backup is a file from outside. Only what the picture
+           dialog itself would have written is taken as a picture: a
+           PNG of the edge it writes, within the size it allows. The
+           contact is kept either way. */
+        QByteArray picture =
+            QByteArray::fromBase64(o["picture"].toString().toLatin1());
+        if (!picture.isEmpty()) {
+            QBuffer buf(&picture);
+            buf.open(QIODevice::ReadOnly);
+            QImageReader reader(&buf, "png");
+            const QSize size = reader.size();
+            if (picture.size() > MAX_PICTURE_BYTES || !size.isValid()
+                || size.width() > PICTURE_EDGE
+                || size.height() > PICTURE_EDGE || reader.read().isNull()) {
+                picture.clear();
+                badPictures++;
+            }
+        }
+        QList<QByteArray> keep;
+        QList<sp_contact_number> numbers;
+        for (const QJsonValue &nv : o["numbers"].toArray()) {
+            keep << nv.toObject()["label"].toString().toUtf8()
+                 << nv.toObject()["uri"].toString().toUtf8();
+        }
+        for (qsizetype k = 0; k + 1 < keep.size(); k += 2) {
+            sp_contact_number num {};
+            num.label = keep[k].isEmpty() ? nullptr : keep[k].constData();
+            num.uri = keep[k + 1].constData();
+            numbers << num;
+        }
+        sp_contact c {};
+        c.name = name.constData();
+        c.company = company.isEmpty() ? nullptr : company.constData();
+        c.note = noteText.isEmpty() ? nullptr : noteText.constData();
+        c.favourite = o["favourite"].toBool();
+        c.numbers = numbers.constData();
+        c.n_numbers = (size_t)numbers.size();
+        if (!picture.isEmpty()) {
+            c.picture = picture.constData();
+            c.picture_len = (size_t)picture.size();
+            c.picture_type = "png";
+        }
+        int64_t id = 0;
+        if (sp_contact_save(m_core, &c, &id) != SP_OK)
+            lost++;
+    }
+    if (lost > 0)
+        problems << tr("%1 contacts could not be saved").arg(lost);
+    if (badPictures > 0)
+        problems << tr("%1 contact pictures were not valid and were left "
+                       "out").arg(badPictures);
+
+    note(tr("backup restored: %1 contacts").arg(contacts.size() - lost));
+    emit restored();
+    return problems.isEmpty()
+               ? QString()
+               : tr("Restored, except: %1.").arg(problems.join("; "));
 }
 
 QVariantList CoreBridge::audioDevices() const {

@@ -513,6 +513,141 @@ int main(int argc, char **argv) {
         }
     }
 
+    printf("backup and restore\n");
+    {
+        const auto wipe = [&b]() {
+            for (const QVariant &v : b.accounts())
+                b.removeAccount(v.toMap()["id"].toLongLong());
+            for (const QVariant &v : b.contacts(QString()))
+                b.deleteContact(v.toMap()["id"].toLongLong());
+        };
+        const auto names = [&b]() {
+            QStringList out;
+            for (const QVariant &v : b.contacts(QString()))
+                out << v.toMap()["name"].toString();
+            return out;
+        };
+        wipe();
+
+        QVariantMap f;
+        f["id"] = "bkprobe";
+        f["user"] = "2000";
+        f["domain"] = "127.0.0.1";
+        f["transport"] = 0;
+        f["persist"] = true;
+        f["doRegister"] = false;
+        f["password"] = "backup-probe-password";
+        f["passwordKnown"] = true;
+        CHECK(b.saveAccount(0, f) != 0);
+        QStringList numbers;
+        numbers << "work|sip:6046@127.0.0.1";
+        const qlonglong probe =
+            b.saveContact(0, "Backup Probe", "Acme", "kept", true, numbers);
+        CHECK(probe != 0);
+        const QString face = QDir::currentPath() + "/bridge-face.png";
+        {
+            QImage img(400, 300, QImage::Format_RGB32);
+            img.fill(Qt::darkCyan);
+            CHECK(img.save(face, "PNG"));
+        }
+        CHECK(b.stagePicture(face).isEmpty());
+        CHECK(b.commitPicture(probe, 50, 0, 300).isEmpty());
+        QFile::remove(face);
+        b.saveWindowSize(431, 713);
+
+        const QString sealed = QDir::currentPath() + "/bridge-sealed.bak";
+        const QString plain = QDir::currentPath() + "/bridge-plain.bak";
+        const QString sealedUrl = QUrl::fromLocalFile(sealed).toString();
+        CHECK(b.backupTo(sealedUrl, "correct horse").isEmpty());
+        CHECK(b.backupTo(plain, QString()).isEmpty());
+        CHECK(b.backupIsSealed(sealedUrl));
+        CHECK(!b.backupIsSealed(plain));
+        {
+            QFile sf(sealed), pf(plain);
+            CHECK(sf.open(QIODevice::ReadOnly));
+            CHECK(pf.open(QIODevice::ReadOnly));
+            CHECK(!sf.readAll().contains("backup-probe-password"));
+            CHECK(pf.readAll().contains("backup-probe-password"));
+            CHECK(!(sf.permissions() & QFileDevice::ReadOther));
+        }
+
+        /* Something else entirely, for the restore to replace. */
+        wipe();
+        QVariantMap other = f;
+        other["id"] = "intruder";
+        other["password"] = "intruder-password";
+        CHECK(b.saveAccount(0, other) != 0);
+        numbers.clear();
+        numbers << "desk|sip:1@127.0.0.1";
+        CHECK(b.saveContact(0, "Intruder", "", "", false, numbers) != 0);
+        b.saveWindowSize(500, 500);
+
+        /* A wrong passphrase and a backup the core refuses both leave
+           the device as it was. */
+        CHECK(!b.restoreFrom(sealedUrl, "wrong").isEmpty());
+        const QString bad = QDir::currentPath() + "/bridge-bad.bak";
+        {
+            QFile bf(bad);
+            CHECK(bf.open(QIODevice::WriteOnly));
+            bf.write("{\"comlink_backup\":1,"
+                     "\"config\":\"accounts: {unterminated\\n\"}");
+        }
+        CHECK(!b.restoreFrom(bad, QString()).isEmpty());
+        CHECK(b.started());
+        CHECK(b.accounts().size() == 1);
+        CHECK(b.accounts().value(0).toMap()["name"].toString()
+              == "intruder");
+        CHECK(names() == QStringList{"Intruder"});
+
+        for (const QString &file : {sealedUrl, plain}) {
+            CHECK(b.restoreFrom(file, "correct horse").isEmpty());
+            CHECK(b.started());
+            const QVariantList as = b.accounts();
+            CHECK(as.size() == 1);
+            CHECK(as.value(0).toMap()["name"].toString() == "bkprobe");
+            const QVariantMap back =
+                b.accountCfg(as.value(0).toMap()["id"].toLongLong());
+            CHECK(back["user"].toString() == "2000");
+            CHECK(back["password"].toString() == "backup-probe-password");
+            CHECK(names() == QStringList{"Backup Probe"});
+            const QVariantMap c = b.contacts(QString()).value(0).toMap();
+            CHECK(c["company"].toString() == "Acme");
+            CHECK(c["favourite"].toBool());
+            CHECK(b.contactPicture(c["id"].toLongLong())
+                      .startsWith("data:image/png;base64,"));
+            const QVariantMap g2 = b.windowSize();
+            CHECK(g2["width"].toInt() == 431 && g2["height"].toInt() == 713);
+            if (SecretStore::available())
+                CHECK(SecretStore::load("account/intruder").isEmpty());
+        }
+
+        /* A picture that is not one is left out, said so, and costs
+           the contact nothing else. */
+        {
+            QFile pf(plain);
+            CHECK(pf.open(QIODevice::ReadOnly));
+            QByteArray text = pf.readAll();
+            pf.close();
+            const qsizetype at = text.indexOf("\"picture\": \"");
+            CHECK(at > 0);
+            const qsizetype from = at + 12;
+            text.replace(from, text.indexOf('"', from) - from,
+                         QByteArray("not a picture").toBase64());
+            CHECK(pf.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            pf.write(text);
+            pf.close();
+            CHECK(b.restoreFrom(plain, QString()).contains("pictures"));
+            CHECK(names() == QStringList{"Backup Probe"});
+            CHECK(b.contactPicture(b.contacts(QString()).value(0).toMap()
+                                       ["id"].toLongLong()).isEmpty());
+        }
+
+        wipe();
+        QFile::remove(sealed);
+        QFile::remove(plain);
+        QFile::remove(bad);
+    }
+
     printf("initials from the core\n");
     CHECK(b.initialsOf("Sylvie Tremblay") == "ST");
     CHECK(b.initialsOf("Repartition") == "R");

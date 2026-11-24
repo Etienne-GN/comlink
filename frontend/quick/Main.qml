@@ -1484,8 +1484,22 @@ Window {
                     }
                     onWindowSizeRequested:
                         CoreBridge.saveWindowSize(root.width, root.height)
+                    /* Every page in the dialog read the configuration
+                       that has just been replaced; closing it is what
+                       makes the next look a fresh one. */
+                    onBackupRestored: {
+                        settingsDialog.close();
+                        restoredNotice.open();
+                    }
                 }
             }
+        }
+        QuestionDialog {
+            id: restoredNotice
+            title: "Restore a backup"
+            kind: "warning"
+            text: "The backup was restored. Settings, accounts, " +
+                  "passwords and contacts are now the ones it held."
         }
 
         DialogHost {

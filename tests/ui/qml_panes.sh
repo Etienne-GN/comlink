@@ -71,6 +71,11 @@ run "dialog-settings-transcript-560x460" COMLINK_QUICK_OVERLAY="settings:7" \
 run "dialog-settings-transcript-270x560" COMLINK_QUICK_OVERLAY="settings:7" \
     COMLINK_QUICK_DIALOG=1 COMLINK_QUICK_SHOT_SIZE=270x560
 
+run "dialog-settings-backup-560x460" COMLINK_QUICK_OVERLAY="settings:8" \
+    COMLINK_QUICK_DIALOG=1 COMLINK_QUICK_SHOT_SIZE=560x460
+run "dialog-settings-backup-270x560" COMLINK_QUICK_OVERLAY="settings:8" \
+    COMLINK_QUICK_DIALOG=1 COMLINK_QUICK_SHOT_SIZE=270x560
+
 run "dialog-logs-transcript-640x480" COMLINK_QUICK_OVERLAY="transcript" \
     COMLINK_QUICK_DIALOG=1 COMLINK_QUICK_SHOT_SIZE=640x480
 run "dialog-logs-transcript-270x560" COMLINK_QUICK_OVERLAY="transcript" \

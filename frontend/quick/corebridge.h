@@ -391,6 +391,22 @@ public:
                                       const QString &note, bool favourite,
                                       const QStringList &numbers);
     Q_INVOKABLE bool deleteContact(qlonglong id);
+
+    /* Everything the operator set up, in one file that can leave the
+       device: the configuration, each account's password out of the
+       credential store, and the contact book with its pictures. Not
+       the call history, the SIP trace or the recordings.
+     *
+     * A passphrase seals the file; without one it is plain text with
+       the passwords readable in it. Each returns an empty string, or
+       why it failed. */
+    Q_INVOKABLE QString backupTo(const QString &url,
+                                 const QString &passphrase);
+    Q_INVOKABLE bool backupIsSealed(const QString &url) const;
+    /* Replaces all of the above with the file's, and restarts the core
+       on it. A backup the core refuses leaves this device as it was. */
+    Q_INVOKABLE QString restoreFrom(const QString &url,
+                                    const QString &passphrase);
     /* Who is this? An empty map when nobody. The matching rule is the
        core's -- exact, on a normalised form -- so an incoming call
        shows the same name on both platforms or shows the URI on
@@ -555,6 +571,9 @@ signals:
     void accountChanged();
     void lastErrorChanged();
     void callChanged();
+    /* A restore put another configuration under the window: whatever a
+       pane read from the core is now stale. */
+    void restored();
     void qualityChanged();
     void logged(const QString &line);
     /* state is an sp_transcript_state; detail says why, for a failure. */
@@ -570,6 +589,8 @@ private:
     friend void spBridgeEvent(const sp_event *ev, void *user);
     QColor  hex(const char *v, const char *fallback) const;
     void reloadTheme();
+    bool openCore();
+    void closeCore();
     void refreshRegistration();
     void watchNetwork();
     QString rewritePicture(qlonglong contactId, const QByteArray &png);

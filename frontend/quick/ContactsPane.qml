@@ -40,6 +40,7 @@ Item {
     Connections {
         target: CoreBridge
         function onStartedChanged() { if (CoreBridge.started) root.reload() }
+        function onRestored() { root.reload() }
     }
 
     /* For the probe and the smoke test: open the editor, and the

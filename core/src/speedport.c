@@ -77,6 +77,7 @@ static sp_speed_mode mode_of(float speed) {
 typedef struct sp_speedport {
     pjmedia_port base;
     pj_pool_t *pool;      /* this wrapper's own; released in on_destroy */
+    pj_bool_t  holds_source;
     pjmedia_port *source; /* never destroyed here -- see speedport.h */
 
     unsigned channels;
@@ -375,7 +376,10 @@ static pj_status_t speedport_on_destroy(pjmedia_port *this_port) {
     sp_speedport *sp = (sp_speedport *)this_port;
     if (sp->wsola)
         pjmedia_wsola_destroy(sp->wsola);
+    pjmedia_port *source = sp->holds_source ? sp->source : NULL;
     pj_pool_release(sp->pool);
+    if (source)
+        pjmedia_port_dec_ref(source);
     return PJ_SUCCESS;
 }
 
@@ -440,6 +444,14 @@ sp_status sp_speedport_create(pj_pool_t *pool_, pjmedia_port *source,
     pjmedia_port_info_init(&sp->base.info, &name,
                            PJMEDIA_SIG_CLASS_PORT_AUD('S', 'P'), clock_rate,
                            channels, 16, samples_per_frame);
+
+    /* The bridge takes this port out on its own thread, some ticks
+       after it is asked to, and get_frame() calls into the source
+       until then. A reference on the source, let go in on_destroy,
+       is what keeps the source there for those calls whatever order
+       the owner destroys the two in. */
+    if (source->grp_lock && pjmedia_port_add_ref(source) == PJ_SUCCESS)
+        sp->holds_source = PJ_TRUE;
 
     *out = &sp->base;
     return SP_OK;

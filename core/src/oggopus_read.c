@@ -464,6 +464,14 @@ sp_status sp_oggopus_reader_create(pj_pool_t *pool_, const char *path,
                            PJMEDIA_SIG_CLASS_PORT_AUD('O', 'R'), clock_rate,
                            channels, 16, samples_per_frame);
 
+    /* Reference-counted, so whoever pulls frames from this on the
+       media thread can keep it alive past its owner's destroy:
+       pjmedia_port_destroy then only drops the owner's reference. */
+    if (pjmedia_port_init_grp_lock(&r->base, pool, NULL) != PJ_SUCCESS) {
+        reader_on_destroy(&r->base);
+        return SP_ERR_INTERNAL;
+    }
+
     *out = &r->base;
     return SP_OK;
 }

@@ -123,6 +123,21 @@ static void playback_eof_cb(pjmedia_port *port, void *user_data) {
    speedport.c's on_destroy touches only the wrapper's own pool, never
    the source, so by the time the source is destroyed below there is
    nothing left for the two to race on. */
+/* A port taken out of core->playback is only good while core->lock is
+   held: a SIP thread stops the playback when a call arrives, and
+   destroys it. hold() is called under the lock and keeps the port
+   alive after it; let_go() after the lock is released, since it may be
+   what destroys the port. NULL when there is nothing to hold. */
+static pjmedia_port *hold(pjmedia_port *port) {
+    return port && port->grp_lock
+               && pjmedia_port_add_ref(port) == PJ_SUCCESS ? port : NULL;
+}
+
+static void let_go(pjmedia_port *port) {
+    if (port)
+        pjmedia_port_dec_ref(port);
+}
+
 static void destroy_loaded(sp_playback_kind kind, pjsua_player_id id,
                            pjmedia_port *ogg_port, pj_pool_t *ogg_pool,
                            pjmedia_port *speed_port, pj_pool_t *speed_pool,
@@ -518,7 +533,7 @@ sp_status sp_playback_set_speed(sp_core *core, float speed) {
         sp_core_detail(core, "nothing is loaded to change the speed of");
         return SP_ERR_STATE;
     }
-    pjmedia_port *speed_port = core->playback.speed_port;
+    pjmedia_port *speed_port = hold(core->playback.speed_port);
     core->playback.speed = speed;
     pthread_mutex_unlock(&core->lock);
 
@@ -530,6 +545,7 @@ sp_status sp_playback_set_speed(sp_core *core, float speed) {
        waiting on. */
     if (speed_port)
         sp_speedport_set_speed(speed_port, speed);
+    let_go(speed_port);
     return SP_OK;
 }
 
@@ -600,8 +616,13 @@ sp_status sp_playback_seek(sp_core *core, uint32_t position_ms) {
        of the new position, worse the faster or slower playback is
        running. Unconditional and harmless at 1.0x: see
        sp_speedport_reset's own comment. */
-    if (speed_port)
-        sp_speedport_reset(speed_port);
+    pthread_mutex_lock(&core->lock);
+    pjmedia_port *held = core->playback.speed_port == speed_port
+                             ? hold(speed_port) : NULL;
+    pthread_mutex_unlock(&core->lock);
+    if (held)
+        sp_speedport_reset(held);
+    let_go(held);
     return SP_OK;
 }
 
@@ -618,13 +639,14 @@ sp_status sp_playback_get(sp_core *core, sp_playback *out) {
        backed by an atomic for exactly this. */
     pthread_mutex_lock(&core->lock);
     sp_playback_kind peek_kind = core->playback.kind;
-    pjmedia_port *peek_ogg_port = core->playback.ogg_port;
+    pjmedia_port *peek_ogg_port = hold(core->playback.ogg_port);
     pthread_mutex_unlock(&core->lock);
     if (peek_kind == SP_PLAYBACK_OGGOPUS && peek_ogg_port) {
         pj_bool_t oeof = PJ_FALSE;
         if (sp_oggopus_reader_is_eof(peek_ogg_port, &oeof) == SP_OK && oeof)
             atomic_store(&core->playback.eof, true);
     }
+    let_go(peek_ogg_port);
 
     /* Reaped here, on the caller's thread, rather than from inside
        the eof callback itself. */
@@ -644,7 +666,7 @@ sp_status sp_playback_get(sp_core *core, sp_playback *out) {
     }
     sp_playback_kind kind = core->playback.kind;
     pjsua_player_id id = core->playback.id;
-    pjmedia_port *ogg_port = core->playback.ogg_port;
+    pjmedia_port *ogg_port = hold(core->playback.ogg_port);
     uint32_t ogg_duration_ms = core->playback.ogg_duration_ms;
     bool paused = core->playback.paused;
     float speed = core->playback.speed;
@@ -685,6 +707,7 @@ sp_status sp_playback_get(sp_core *core, sp_playback *out) {
         if (ogg_port && sp_oggopus_reader_get_pos_ms(ogg_port, &pos) == SP_OK)
             position_ms = pos;
     }
+    let_go(ogg_port);
 
     out->state = paused ? SP_PLAY_PAUSED : SP_PLAY_PLAYING;
     out->position_ms = (uint32_t)position_ms;
